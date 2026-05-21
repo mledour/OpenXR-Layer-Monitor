@@ -1,201 +1,199 @@
-# OpenXR-Layer-Template
+# OpenXR-Layer-Monitor
 
-A starting point for building an OpenXR API layer on Windows, with
-everything-but-the-kitchen-sink scaffolding so you can focus on the
-layer's own logic instead of plumbing.
+Sandwich CPU profiler for OpenXR API layers. Drops two thin layers around a
+target layer in the OpenXR loader chain and measures how much per-frame CPU
+time the target consumes.
 
-Based on [`mbucchia/OpenXR-Layer-Template`](https://github.com/mbucchia/OpenXR-Layer-Template)
-— huge thanks to Matthieu Bucchianeri for the original framework. This
-template **adds** the following on top of his work:
+```
+app -> XR_APILAYER_MLEDOUR_layer_monitor_pre
+    -> <target layer>
+    -> XR_APILAYER_MLEDOUR_layer_monitor_post
+    -> runtime
+```
 
-- **GitHub Actions CI** that builds Debug + Release x64, runs unit
-  tests, builds an Inno Setup installer, signs everything, and creates
-  a GitHub Release on every `v*.*.*` tag push
-- **Code signing pipeline** (Certum Open Source Code Signing Cloud)
-  driven headlessly via the undocumented `SimplySignDesktop /autologin`
-  flag — the only known public recipe for headless Certum signing on
-  a GitHub-hosted Windows runner. Skip-on-fork built in
-- **Inno Setup installer** that installs to `C:\Program Files\` (correct
-  ACLs for sandboxed identities), registers under HKLM, and creates an
-  Add/Remove Programs entry
-- **VERSIONINFO from git tag** baked into the DLL via a pre-build script
-- **doctest unit test target** with an in-process mock OpenXR runtime,
-  so you can drive your layer through `xrCreateInstance` ↔ `xrEndFrame`
-  without a loader, GPU, or HMD
-- **D3D11 + D3D12 (via D3D11On12) support in `pch.h`**, all delay-loaded
-  so your layer DLL doesn't load `d3d11.dll` / `d3d12.dll` into game
-  processes that never exercise your graphics path
-- **HKLM install / uninstall PowerShell scripts** + signed installer
-- **`docs/DEVELOPMENT.md`** with the signing pipeline written up in
-  enough detail that you (or your future self) can debug it
-- **`docs/CTS_TESTING.md`** for how to run the OpenXR CTS against your
-  layer on a real machine — useful long before you ship
+Each side records a QPC timestamp on entry to and exit from its own
+`xrEndFrame` override. Subtracting the post-side bracket from the pre-side
+bracket isolates the target layer's CPU cost on the frame thread:
 
-## Quick start
+```
+pre.bracket  = entry..exit  =  target_work + post_overhead + runtime
+post.bracket = entry..exit  =  runtime
+target_cpu   = pre.bracket - post.bracket
+```
+
+Built on [`mbucchia/OpenXR-Layer-Template`](https://github.com/mbucchia/OpenXR-Layer-Template).
+
+## Status
+
+| Capability                 | Status |
+| -------------------------- | ------ |
+| CPU sandwich on xrEndFrame | yes (MVP) |
+| Other per-frame functions  | not yet (xrWaitFrame / xrBeginFrame / xrLocateViews / xrSyncActions) |
+| GPU timestamps (D3D11/12)  | not yet |
+| ETW emission               | yes (TraceLoggingWrite, see `scripts/Tracing.wprp`) |
+| CSV per process            | yes (`%LOCALAPPDATA%\<LayerName>\frames-<pid>.csv`) |
+
+## How it works
+
+The two layers are **two separate DLLs built from the same source**. They are
+not one DLL registered twice: the framework keeps a singleton `g_instance` per
+DLL, so a single DLL registered as two chain slots would have its own dispatch
+table stomp itself. Splitting into `_pre.dll` + `_post.dll` keeps each side's
+state isolated.
+
+Source code knows which side it is via a `constexpr` check on `LAYER_NAME`
+(suffix `_post` -> post side, anything else -> pre side). `LAYER_NAME` is set
+to `$(SolutionName)` at compile time, so the two `.sln` files at the repo
+root drive the side selection without any code edits.
+
+The frame thread's only work inside `xrEndFrame` is:
+1. Two `QueryPerformanceCounter` calls (~20 ns each).
+2. `TraceLoggingWrite` ETW event (~50 ns).
+3. Brief mutex + push of a 32-byte POD to a queue (~100 ns).
+
+A dedicated background thread drains the queue and writes the CSV. **No disk
+I/O on the frame thread**, because synchronous I/O inside the pre-side
+bracket would inflate `target_cpu` by the post-side's CSV write time. See
+`framework/log.h`'s DBWinMutex warning for why the framework's `Log()` is
+also banned from the hot path.
+
+## Build
+
+Prerequisites: Visual Studio 2019+ with the Desktop C++ workload, Python 3,
+PowerShell, and the OpenXR submodules:
 
 ```powershell
-# 1. Click "Use this template" on GitHub to get your own copy, then
-#    clone it locally.
-git clone https://github.com/<your-user>/<your-repo>.git
-cd <your-repo>
-
-# 2. Pull the OpenXR submodules.
 git submodule update --init --recursive
-
-# 3. Run the post-clone init script. It asks for your vendor tag,
-#    layer name, your real name, year, etc., and substitutes them
-#    across the tree (filenames AND file contents).
-#    Windows:
-powershell -ExecutionPolicy Bypass -File .\scripts\Init-Template.ps1
-#    macOS / Linux / WSL:
-#    bash scripts/init-template.sh
-
-# 4. Open the renamed .sln in Visual Studio 2019+ and build Release|x64.
-#    The pre-build event runs framework\dispatch_generator.py to produce
-#    dispatch.gen.{h,cpp} from layer_apis.py, then bakes the version into
-#    VERSIONINFO. You should get a DLL + test binary at the first build.
 ```
 
-The shipped skeleton overrides exactly one OpenXR function
-(`xrCreateInstance`) and just logs the application name and runtime
-identity. That's a sanity check the layer is loading. From there:
-
-- Add functions to `override_functions` in
-  [`openxr-api-layer/framework/layer_apis.py`](./openxr-api-layer/framework/layer_apis.py)
-- Override the matching method on `OpenXrLayer` in
-  [`openxr-api-layer/layer.cpp`](./openxr-api-layer/layer.cpp)
-- Anything you don't override is forwarded to the next layer / runtime
-  automatically by the framework
-
-The `layer.cpp` in the template has commented examples for a typical
-`xrLocateViews` override.
-
-## What's in the box
-
-```
-.
-├── .github/workflows/build-and-release.yml   # CI: build, test, sign, release
-├── installer/installer.iss                   # Inno Setup script (auto-built)
-├── openxr-api-layer/
-│   ├── framework/                            # dispatch generator, entry, log
-│   ├── layer.cpp / layer.h                   # ← your layer code goes here
-│   ├── pch.h                                 # D3D11 + D3D12 includes (delay-loaded)
-│   └── XR_APILAYER_<vendor>_<name>.json      # loader manifest
-├── openxr-api-layer-tests/
-│   ├── main.cpp                              # doctest entry point
-│   ├── mock_runtime.{h,cpp}                  # in-process OpenXR mock
-│   ├── test_example.cpp                      # ← your tests go here
-│   └── test_stubs.cpp                        # symbols entry.cpp normally provides
-├── scripts/
-│   ├── Init-Template.ps1                     # post-clone placeholder substitution
-│   ├── Generate-VersionRc.ps1                # bakes git tag into VERSIONINFO
-│   ├── Get-CertumTotp.ps1                    # RFC 6238 TOTP (Certum auth)
-│   ├── Sign-Artifact.ps1                     # headless Certum signing flow
-│   ├── Test-CertumTotp.ps1                   # offline TOTP self-test
-│   ├── Install-Layer.ps1                     # HKLM register (manual install)
-│   └── Uninstall-Layer.ps1                   # HKLM unregister
-├── docs/
-│   ├── DEVELOPMENT.md                        # CI + signing + framework internals
-│   └── CTS_TESTING.md                        # how to run OpenXR CTS locally
-├── external/                                 # OpenXR SDK + MixedReality (submodules)
-├── LICENSE                                   # MIT (yours + mbucchia attribution)
-└── README.md                                 # ← rewrite this for your layer
-```
-
-## CI / signing setup
-
-Skip this section if you don't care about signed releases — the CI
-will build and produce unsigned artifacts just fine without any
-secrets. The signing steps fall through cleanly on PR builds, forks,
-and any tag push made without the secrets configured.
-
-If you DO want signed releases:
-
-1. Get a code signing certificate. The cheapest legitimate option for
-   open-source projects is [Certum Open Source Code Signing Cloud](https://shop.certum.eu/en/open-source-code-signing-in-the-cloud-1-year.html)
-   (~25 €/yr at time of writing).
-2. Enroll the 2FA in the SimplySign portal. During the QR-code step,
-   save the Base32 **seed** (the otpauth URI's `secret=` parameter) —
-   not the current 6-digit code. You need the seed for CI.
-3. Add three GitHub repo Secrets (Settings → Secrets and variables →
-   Actions):
-   - `CERTUM_USERNAME` — your SimplySign portal email
-   - `CERTUM_TOTP_SEED` — the Base32 seed from step 2
-   - `CERTUM_CERT_THUMBPRINT` — 40-hex-char SHA-1 of the issued cert
-4. Tag a release (`git tag v0.0.1 && git push origin v0.0.1`). The
-   workflow signs the DLL + Setup.exe and attaches everything to a
-   GitHub Release automatically.
-
-[`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) has the full write-up
-on how the signing pipeline works — including why we use
-`SimplySignDesktop /autologin` and what to do when Certum updates the
-desktop client.
-
-## Test loop
-
-`openxr-api-layer-tests` builds alongside the DLL and runs after every
-build (the workflow fails on a non-zero test exit). Add your own tests
-under `openxr-api-layer-tests/test_*.cpp` and list them in the test
-project's `<ClCompile>` items.
-
-Two patterns to know:
-
-- **Unit tests on pure helpers** — just `#include` the header and
-  `CHECK(...)`. No OpenXR types involved. Fast.
-- **Integration tests via `mock_runtime`** — drives `OpenXrLayer`
-  through `xrCreateInstance` ↔ `xrEndFrame` with a fake runtime that
-  produces deterministic FOV / pose data. No GPU, no HMD, no loader.
-
-`test_example.cpp` shows the minimal doctest pattern and has a
-commented-out integration example.
-
-## Releasing
+Build both halves in one go:
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+pwsh scripts\Build-All.ps1                          # Release|x64
+pwsh scripts\Build-All.ps1 -Configuration Debug
+pwsh scripts\Build-All.ps1 -Platform Win32          # 32-bit pair
 ```
 
-The workflow handles the rest:
+Or build each `.sln` independently from Visual Studio:
 
-1. Builds Debug + Release x64 in parallel
-2. Runs the test binary; non-zero exit fails the job
-3. (Release only) Builds the Inno Setup installer
-4. (Tag push only) Signs the DLL + installer if the Certum secrets
-   are set
-5. (Tag push only) Creates a GitHub Release with both ZIPs + the
-   Setup.exe attached
+- `XR_APILAYER_MLEDOUR_layer_monitor_pre.sln`
+- `XR_APILAYER_MLEDOUR_layer_monitor_post.sln`
 
-Builds on non-tag pushes (main, PRs, manual `workflow_dispatch`)
-produce unsigned verification artifacts and don't create a release.
+Both solutions reference the same `openxr-api-layer/openxr-api-layer.vcxproj`
+and share the same `bin\<Platform>\<Configuration>\` output folder, so after
+building both you get four files side-by-side:
 
-## Conventions inherited from this template
+```
+XR_APILAYER_MLEDOUR_layer_monitor_pre.dll
+XR_APILAYER_MLEDOUR_layer_monitor_pre.json
+XR_APILAYER_MLEDOUR_layer_monitor_post.dll
+XR_APILAYER_MLEDOUR_layer_monitor_post.json
+```
 
-These are decisions baked into the framework — feel free to override
-them if your layer has different needs, but they're the defaults:
+## Install
 
-- **HKLM registration**, not HKCU (anti-cheat and OpenXR Tools for WMR
-  expect this — see the upstream `docs/openxr_api_layers_best_practices.md`
-  rule 2)
-- **Settings file per OpenXR application** at
-  `%LOCALAPPDATA%\<your-layer-name>\<app>_settings.json`, plus a
-  global `settings.json` template
-- **Log file per application** at
-  `%LOCALAPPDATA%\<your-layer-name>\<app>.log`
-- **Graceful degradation, never crash** — every overridden method
-  should check `m_bypassApiLayer` and forward to the runtime if your
-  feature can't run safely for this context
-- **Delay-loaded D3D DLLs** so the layer doesn't bloat the process
-  load image of Vulkan-only or D3D12-only games that don't trigger
-  your graphics path
+The post-build event copies `Install-Layer.ps1` and `Uninstall-Layer.ps1`
+into the output folder. Run them from there:
+
+```powershell
+cd bin\x64\Release
+.\Install-Layer.ps1
+```
+
+The script registers both pre and post manifests under
+`HKLM\Software\Khronos\OpenXR\1\ApiLayers\Implicit`. The 32-bit equivalents
+register under `HKLM\Software\WOW6432Node\...`.
+
+## Positioning the target layer
+
+The OpenXR loader walks `HKLM\Software\Khronos\OpenXR\1\ApiLayers\Implicit`
+in insertion order. To measure a third-party layer, you need:
+
+```
+ApiLayers\Implicit:
+  XR_APILAYER_MLEDOUR_layer_monitor_pre.json
+  <target_layer>.json
+  XR_APILAYER_MLEDOUR_layer_monitor_post.json
+```
+
+If `<target_layer>` is registered between pre and post in HKLM ordering, the
+sandwich captures it correctly. If anything else sits in between, the
+attribution becomes "everything between pre and post" rather than the target
+alone.
+
+To verify the order, use `reg query HKLM\Software\Khronos\OpenXR\1\ApiLayers\Implicit`
+or the OpenXR Explorer tool.
+
+## Output
+
+Each side writes one CSV per host process to its own folder:
+
+```
+%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor_pre\frames-<pid>.csv
+%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor_post\frames-<pid>.csv
+```
+
+Format (header lines start with `#`):
+
+```
+# qpc_freq=10000000
+# side=pre
+# layer=XR_APILAYER_MLEDOUR_layer_monitor_pre
+# fn=xrEndFrame
+frame_idx,thread_id,qpc_entry,qpc_exit
+0,12345,17834950123456,17834950456789
+1,12345,17834951678901,17834951901234
+...
+```
+
+`frame_idx` matches between pre and post by call order. Merge with the
+analyzer script:
+
+```powershell
+python scripts\analyze.py %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor_pre\frames-<pid>.csv `
+                          %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor_post\frames-<pid>.csv
+```
+
+This prints summary stats (median, p95, p99, max in microseconds) and writes
+a merged `target_cpu.csv` with a `target_us` column.
+
+For continuous capture, the ETW provider is the same GUID for both sides;
+events carry a `Side` field. Use `wpr -start scripts\Tracing.wprp` and
+`wpr -stop monitor.etl`, then load `.etl` in WPA.
+
+## Caveats
+
+- **CPU only, on the frame thread only.** Off-thread work that the target
+  layer kicks off (e.g. a worker thread, a fire-and-forget compute pass) is
+  not captured. A naive sandwich cannot see what the layer doesn't do
+  synchronously inside its xrEndFrame override.
+- **The CSV write overhead in the post side is invisible to the math** but
+  shows up as wall-clock drift on the host process. Frame-budget impact at
+  90 Hz with a 256-entry queue is below 0.1% in practice.
+- **Layer ordering is enforced by the user, not by this layer.** If a fourth
+  layer slips between pre and target (or between target and post), its CPU
+  gets attributed to the target.
+- **Single XrSession assumption.** Frame counters are per-DLL globals.
+  Re-running an OpenXR app in the same process (probe-then-real init) writes
+  back-to-back rows for both runs; split them on a `frame_idx` reset.
+- **Process lifetime, not session lifetime.** The CSV is truncated when the
+  writer thread starts (on xrCreateInstance) and the writer thread joins on
+  xrDestroyInstance. Process exit without xrDestroyInstance flushes the
+  queue's tail by virtue of the destructor running through `ResetInstance()`.
+
+## Disabling at runtime
+
+The standard OpenXR loader escape hatch works:
+
+```cmd
+set DISABLE_XR_APILAYER_MLEDOUR_layer_monitor_pre=1
+set DISABLE_XR_APILAYER_MLEDOUR_layer_monitor_post=1
+```
+
+Set these before launching the host application to bypass both layers
+without touching the registry.
 
 ## License
 
-MIT License — see [LICENSE](./LICENSE).
-
-The framework code (`openxr-api-layer/framework/`, dispatch generator,
-`module.def`, entry point, logging helpers) is the work of Matthieu
-Bucchianeri (`mbucchia`), Copyright © 2022-2023. Everything else is
-new in this template. If you fork this template, your own work goes
-under your name in the LICENSE; please keep mbucchia's attribution
-intact.
+MIT. See [`LICENSE`](LICENSE). Original template by Matthieu Bucchianeri,
+also MIT.

@@ -4,8 +4,8 @@
     "name": "XR_APILAYER_name",
     "library_path": ".\\XR_APILAYER_name-32.dll",
     "api_version": "1.0",
-    "implementation_version": "2",
-    "description": "Narrows the effective field of view and swapchain resolution to reduce GPU load.",
+    "implementation_version": "1",
+    "description": "Post side of the layer-monitor sandwich (32-bit). Records timestamps after the layer under measurement; pair with the matching _pre layer to measure CPU (and later GPU) cost of a target OpenXR layer.",
     "functions": {
       "xrNegotiateLoaderApiLayerInterface": "xrNegotiateLoaderApiLayerInterface"
     },

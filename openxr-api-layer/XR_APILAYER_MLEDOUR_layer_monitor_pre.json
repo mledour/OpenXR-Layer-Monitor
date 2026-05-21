@@ -1,0 +1,14 @@
+{
+  "file_format_version" : "1.0.0",
+  "api_layer": {
+    "name": "XR_APILAYER_name",
+    "library_path": ".\\XR_APILAYER_name.dll",
+    "api_version": "1.0",
+    "implementation_version": "1",
+    "description": "Pre side of the layer-monitor sandwich. Records timestamps before the layer under measurement; pair with the matching _post layer to measure CPU (and later GPU) cost of a target OpenXR layer.",
+    "functions": {
+      "xrNegotiateLoaderApiLayerInterface": "xrNegotiateLoaderApiLayerInterface"
+    },
+    "disable_environment": "DISABLE_XR_APILAYER_name"
+  }
+}

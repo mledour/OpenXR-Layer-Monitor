@@ -102,7 +102,7 @@ $Year = [int]$Year  # cast in case CLI passed a string
 # Substitutions applied to BOTH file contents AND filenames.
 #
 # The fully-qualified layer-name placeholder is the literal string
-# `XR_APILAYER_NOVENDOR_template` — this matches:
+# `XR_APILAYER_MLEDOUR_monitor` — this matches:
 #   - The .sln / .json filenames the template ships with.
 #   - References to those filenames in CI workflow env vars, the
 #     vcxproj, scripts, docs, etc.
@@ -111,16 +111,16 @@ $Year = [int]$Year  # cast in case CLI passed a string
 # We substitute it as a single unit so the renamed .sln, the renamed
 # JSON manifests, and every reference to them stay consistent.
 #
-# `<<VENDOR>>` and `<<LAYER_NAME>>` are kept as separate placeholders
+# `MLEDOUR` and `monitor` are kept as separate placeholders
 # for the few content spots that need vendor or layer-short-name
 # standalone — e.g. the ETW trace string in layer.cpp, or a comment
 # that splits them out for readability. They never appear in file
 # names (which would break Windows checkout — `<` and `>` are
 # reserved characters).
 #
-# Order matters: the longest pattern goes first so `<<AUTHOR_NAME>>`
+# Order matters: the longest pattern goes first so `Michael Ledour`
 # does not accidentally match the inside of
-# `<<AUTHOR_NAME_AS_ON_CERT>>`.
+# `Michael Ledour`.
 $fullLayerName = "XR_APILAYER_${Vendor}_${LayerName}"
 # Inno Setup AppId — fresh per layer so two layers forked from this
 # template don't collide. Two products sharing an AppId make the second
@@ -129,15 +129,15 @@ $fullLayerName = "XR_APILAYER_${Vendor}_${LayerName}"
 # {{XXXX-XXXX-...}} convention in installer.iss.
 $installerAppId = ([guid]::NewGuid().ToString()).ToUpperInvariant()
 $substitutions = @(
-    @{ From = 'XR_APILAYER_NOVENDOR_template'; To = $fullLayerName }
-    @{ From = '<<VENDOR>>';                    To = $Vendor }
-    @{ From = '<<LAYER_NAME>>';                To = $LayerName }
-    @{ From = '<<AUTHOR_NAME_AS_ON_CERT>>';    To = $AuthorNameAsOnCert }
-    @{ From = '<<AUTHOR_NAME>>';               To = $AuthorName }
-    @{ From = '<<AUTHOR_EMAIL>>';              To = $AuthorEmail }
-    @{ From = '<<AUTHOR_GITHUB_HANDLE>>';      To = $GitHubOwner }
-    @{ From = '<<YEAR>>';                      To = $Year.ToString() }
-    @{ From = '<<INSTALLER_APP_ID>>';          To = $installerAppId }
+    @{ From = 'XR_APILAYER_MLEDOUR_monitor'; To = $fullLayerName }
+    @{ From = 'MLEDOUR';                    To = $Vendor }
+    @{ From = 'monitor';                To = $LayerName }
+    @{ From = 'Michael Ledour';    To = $AuthorNameAsOnCert }
+    @{ From = 'Michael Ledour';               To = $AuthorName }
+    @{ From = 'michael.ledour@gmail.com';              To = $AuthorEmail }
+    @{ From = 'mledour';      To = $GitHubOwner }
+    @{ From = '2026';                      To = $Year.ToString() }
+    @{ From = '25EB8E51-53A8-465F-8456-4E6446055DCB';          To = $installerAppId }
 )
 
 Write-Host ''

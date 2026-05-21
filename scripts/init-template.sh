@@ -190,8 +190,8 @@ fi
 # ---- summary ------------------------------------------------------------
 
 # Substitutions applied to BOTH file contents AND filenames. Order
-# matters: the longest pattern goes first so <<AUTHOR_NAME>> does not
-# accidentally match the inside of <<AUTHOR_NAME_AS_ON_CERT>>.
+# matters: the longest pattern goes first so Michael Ledour does not
+# accidentally match the inside of Michael Ledour.
 full_layer_name="XR_APILAYER_${vendor}_${layer_name}"
 
 # Inno Setup AppId — fresh per layer so two layers forked from this
@@ -214,15 +214,15 @@ fi
 # Parallel arrays — bash 3 (macOS default) does not support
 # associative arrays portably, so we use index-aligned lists.
 subs_from=(
-    "XR_APILAYER_NOVENDOR_template"
-    "<<VENDOR>>"
-    "<<LAYER_NAME>>"
-    "<<AUTHOR_NAME_AS_ON_CERT>>"
-    "<<AUTHOR_NAME>>"
-    "<<AUTHOR_EMAIL>>"
-    "<<AUTHOR_GITHUB_HANDLE>>"
-    "<<YEAR>>"
-    "<<INSTALLER_APP_ID>>"
+    "XR_APILAYER_MLEDOUR_monitor"
+    "MLEDOUR"
+    "monitor"
+    "Michael Ledour"
+    "Michael Ledour"
+    "michael.ledour@gmail.com"
+    "mledour"
+    "2026"
+    "25EB8E51-53A8-465F-8456-4E6446055DCB"
 )
 subs_to=(
     "$full_layer_name"

@@ -19,13 +19,13 @@
 # OpenXrLayer; the framework already routes them. See layer.cpp for
 # the xrCreateInstance override shipped with this template.
 #
-# Common candidates to add here, uncomment as you need them:
-#   "xrGetSystem",                        # detect target HMD / runtime
-#   "xrCreateSession",                    # spin up per-session state
-#   "xrEnumerateViewConfigurationViews",  # resize swapchain (FOV crop, super-res, etc.)
-#   "xrLocateViews",                      # rewrite per-eye pose / FOV
-#   "xrEndFrame",                         # inspect or extend submitted layers
+# Per-frame functions the sandwich measures. xrEndFrame is the canonical
+# entry point for a target layer's per-frame work (composition build,
+# texture copies, FOV mutation, etc.) so it is the MVP target. Add
+# xrWaitFrame / xrBeginFrame / xrLocateViews here later if you want to
+# measure those separately — each will get its own paired ETW + CSV rows.
 override_functions = [
+    "xrEndFrame",
 ]
 
 # Extra OpenXR functions the layer wants to *call* on the runtime (in

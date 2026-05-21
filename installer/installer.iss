@@ -1,4 +1,4 @@
-; installer.iss — Inno Setup script for XR_APILAYER_NOVENDOR_template
+; installer.iss — Inno Setup script for XR_APILAYER_MLEDOUR_monitor
 ;
 ; Builds a single-file Setup.exe that:
 ;   1. Copies the DLL + JSON manifest to Program Files (correct ACLs for
@@ -12,7 +12,7 @@
 ; The /DMyAppVersion flag is mandatory for tagged builds; for local dev
 ; builds without it, the fallback "0.0.0-dev" is used.
 
-#define MyAppName "XR_APILAYER_NOVENDOR_template"
+#define MyAppName "XR_APILAYER_MLEDOUR_monitor"
 
 ; Accept version from the ISCC command line (/DMyAppVersion=x.y.z).
 ; Fall back to a dev placeholder when compiling interactively.
@@ -25,7 +25,7 @@
 ; Do NOT change it between releases of THIS layer — Inno Setup uses
 ; it to detect an existing installation and offer an upgrade.
 ;
-; The `<<INSTALLER_APP_ID>>` placeholder is filled in with a freshly
+; The `25EB8E51-53A8-465F-8456-4E6446055DCB` placeholder is filled in with a freshly
 ; generated UUID by Init-Template.ps1 / init-template.sh when this
 ; template is forked, so every layer ships with its own AppId out of
 ; the box. If you skipped the init script and your AppId still reads
@@ -33,14 +33,14 @@
 ; into each other's folders — the second Setup.exe sees a "previous
 ; install" with the same AppId and routes the files into that
 ; product's DefaultDirName.
-AppId={{<<INSTALLER_APP_ID>>}
+AppId={{25EB8E51-53A8-465F-8456-4E6446055DCB}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
-AppPublisher=<<AUTHOR_NAME>>
-AppPublisherURL=https://github.com/<<AUTHOR_GITHUB_HANDLE>>/OpenXR-Layer-<<LAYER_NAME>>
-AppSupportURL=https://github.com/<<AUTHOR_GITHUB_HANDLE>>/OpenXR-Layer-<<LAYER_NAME>>/issues
-DefaultDirName={autopf}\OpenXR-Layer-<<LAYER_NAME>>
+AppPublisher=Michael Ledour
+AppPublisherURL=https://github.com/mledour/OpenXR-Layer-monitor
+AppSupportURL=https://github.com/mledour/OpenXR-Layer-monitor/issues
+DefaultDirName={autopf}\OpenXR-Layer-monitor
 ; No Start Menu group — this layer has no user-facing executable.
 DisableProgramGroupPage=yes
 LicenseFile=..\LICENSE
