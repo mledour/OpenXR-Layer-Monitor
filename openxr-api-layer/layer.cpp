@@ -40,8 +40,9 @@
 // Both DLLs live in separate address spaces (different .dll files -> different
 // singletons), so they cannot share in-process state directly. They each emit:
 //   1. An ETW event per frame via TraceLoggingWrite (~50 ns, no I/O, no locks).
-//   2. A row to %LOCALAPPDATA%\<LayerName>\frames-<pid>.csv from a background
+//   2. A row to %LOCALAPPDATA%\<base>\frames-<pid>-<side>.csv from a background
 //      writer thread, so the frame thread only ever does a brief lock + push.
+//      <base> is the shared folder (suffix _pre/_post stripped in entry.cpp).
 //
 // Offline (or via a small consumer) the two CSVs / two ETW streams are merged
 // by (pid, thread_id, frame_idx) and target_cpu is computed per frame.
@@ -163,11 +164,14 @@ namespace openxr_api_layer {
 
           private:
             void Run() {
-                // %LOCALAPPDATA%\<LayerName>\ is created by entry.cpp before
-                // we get here. Suffix the CSV by PID so concurrent OpenXR
-                // processes don't trample each other.
+                // entry.cpp resolves localAppData to the SHARED base folder
+                // (suffix _pre / _post stripped), so we add the side back into
+                // the CSV filename to keep pre and post outputs distinct.
+                // PID also goes in the name so concurrent OpenXR processes
+                // don't trample each other.
                 const std::filesystem::path path =
-                    localAppData / fmt::format("frames-{}.csv", GetCurrentProcessId());
+                    localAppData / fmt::format("frames-{}-{}.csv",
+                                               GetCurrentProcessId(), kSideStr);
 
                 std::ofstream stream(path, std::ios::out | std::ios::trunc);
                 if (!stream) {
@@ -266,7 +270,9 @@ namespace openxr_api_layer {
             Log(fmt::format("QPC frequency: {} Hz\n", QpcFreqHz()));
             Log(fmt::format(
                 "Writing frames to: {}\n",
-                (localAppData / fmt::format("frames-{}.csv", GetCurrentProcessId())).string()));
+                (localAppData / fmt::format("frames-{}-{}.csv",
+                                            GetCurrentProcessId(), kSideStr))
+                    .string()));
 
             g_csv.Start();
             return result;

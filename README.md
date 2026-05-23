@@ -126,13 +126,14 @@ or remove the two HKLM values manually.
 3. Close the app cleanly (don't kill the process -- a clean shutdown
    flushes the CSV write queue).
 4. Find the process ID your app ran under (Task Manager / Process
-   Explorer / a saved log file). Each run produces a `frames-<pid>.csv`.
+   Explorer / a saved log file). Each run produces
+   `frames-<pid>-pre.csv` and `frames-<pid>-post.csv` side by side in
+   the layer's `%LOCALAPPDATA%` folder.
 5. Run the analyzer:
 
 ```powershell
-python scripts\analyze.py `
-  "$env:LOCALAPPDATA\XR_APILAYER_MLEDOUR_layer_monitor_pre\frames-<pid>.csv" `
-  "$env:LOCALAPPDATA\XR_APILAYER_MLEDOUR_layer_monitor_post\frames-<pid>.csv"
+$dir = "$env:LOCALAPPDATA\XR_APILAYER_MLEDOUR_layer_monitor"
+python scripts\analyze.py "$dir\frames-<pid>-pre.csv" "$dir\frames-<pid>-post.csv"
 ```
 
 Example output:
@@ -209,17 +210,17 @@ get garbage timing data (or no data at all).
 
 ## Where the output goes
 
-Each DLL writes into its own `%LOCALAPPDATA%` folder, created on first
-`xrCreateInstance`:
+Both DLLs share a single `%LOCALAPPDATA%` folder, created on first
+`xrCreateInstance`. The framework's `.log` files keep their full
+per-side names so they coexist there; the per-frame CSVs carry a
+`-pre` / `-post` suffix:
 
 ```
-%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor_pre\
-    XR_APILAYER_MLEDOUR_layer_monitor_pre.log    init log (app name, runtime, QPC freq)
-    frames-<pid>.csv                              one row per xrEndFrame call
-
-%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor_post\
+%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\
+    XR_APILAYER_MLEDOUR_layer_monitor_pre.log     init log (app name, runtime, QPC freq)
     XR_APILAYER_MLEDOUR_layer_monitor_post.log
-    frames-<pid>.csv
+    frames-<pid>-pre.csv                           one row per xrEndFrame call
+    frames-<pid>-post.csv
 ```
 
 CSV format (header rows start with `#`):
