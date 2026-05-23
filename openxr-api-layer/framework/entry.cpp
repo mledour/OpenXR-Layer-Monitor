@@ -64,7 +64,24 @@ XrResult __declspec(dllexport) XRAPI_CALL
         }
     }
 
-    localAppData = std::filesystem::path(getenv("LOCALAPPDATA")) / LayerName;
+    // Pre and post halves share a single %LOCALAPPDATA% subfolder so the
+    // user has one place to look for both .log files and both frames CSVs.
+    // We strip the _pre / _post suffix from LayerName to get the shared
+    // base; this is specific to this layer's sandwich pattern (a vanilla
+    // template-derived layer would just use LayerName here). The .log
+    // filename below still embeds the full LayerName, so both halves'
+    // logs coexist in the shared folder without colliding.
+    {
+        std::string baseName = LayerName;
+        for (const std::string_view suffix : {std::string_view("_pre"), std::string_view("_post")}) {
+            if (baseName.size() > suffix.size() &&
+                baseName.compare(baseName.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                baseName.resize(baseName.size() - suffix.size());
+                break;
+            }
+        }
+        localAppData = std::filesystem::path(getenv("LOCALAPPDATA")) / baseName;
+    }
     CreateDirectoryA(localAppData.string().c_str(), nullptr);
 
     // Start logging to file.

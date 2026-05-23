@@ -97,7 +97,7 @@ body:
     attributes:
       label: What actually happened?
       placeholder: |
-        Only one frames-<pid>.csv was produced (pre side empty), so
+        Only frames-<pid>-post.csv was produced (no pre file), so
         analyze.py reports zero matched frames.
     validations:
       required: true
@@ -123,7 +123,7 @@ body:
       label: Pre-side log
       description: |
         Content of
-        `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor_pre\XR_APILAYER_MLEDOUR_layer_monitor_pre.log`
+        `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\XR_APILAYER_MLEDOUR_layer_monitor_pre.log`
         (first ~30 lines suffice if the issue is at init; otherwise the
         section covering the symptom).
       render: shell
@@ -136,7 +136,7 @@ body:
       label: Post-side log
       description: |
         Content of
-        `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor_post\XR_APILAYER_MLEDOUR_layer_monitor_post.log`.
+        `%LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\XR_APILAYER_MLEDOUR_layer_monitor_post.log`.
       render: shell
     validations:
       required: false
