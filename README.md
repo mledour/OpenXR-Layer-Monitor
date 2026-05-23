@@ -138,19 +138,47 @@ python scripts\analyze.py `
 Example output:
 
 ```
-matched frames:   1842
-target_us mean:     12.34
-target_us median:    8.10
-target_us p95:      45.20
-target_us p99:     128.40
-target_us max:     341.70
-target_us min:      0.30
-wrote target_cpu.csv
+matched frames: 1842
+
+target_us          (microseconds):
+    count  1842
+    mean      12.34
+    median     8.10
+    p95       45.20
+    p99      128.40
+    min        0.30
+    max      341.70
+
+target_pct_of_frame (% of frame interval):
+    count  1841
+    mean      0.111
+    median    0.073
+    p95       0.407
+    p99       1.156
+    min       0.003
+    max       3.078
+
+frame_interval_us median: 11100.00  (~90.1 Hz)
+wrote frames-merged.csv
 ```
 
-`target_cpu.csv` has one row per frame with `pre_us`, `post_us`, and
-`target_us`. Drop it into a spreadsheet / pandas / your plotting tool of
-choice for distribution charts.
+`frames-merged.csv` has **one row per frame** with these columns:
+
+| column                  | meaning |
+| ----------------------- | ------- |
+| `frame_idx`             | matched index between pre and post |
+| `thread_id`             | thread that called `xrEndFrame` |
+| `frame_interval_us`     | wall-clock between this and the next frame's pre-entry (blank on the last row) |
+| `pre_us`                | pre-side bracket = target + post + runtime |
+| `post_us`               | post-side bracket = runtime |
+| `target_us`             | `pre_us − post_us` -- the target layer's CPU cost |
+| `target_pct_of_frame`   | `target_us / frame_interval_us * 100` (blank on the last row) |
+
+Drop it into a spreadsheet / pandas / your plotting tool of choice. The
+`target_pct_of_frame` column answers "what slice of the host's frame
+budget did this layer eat" directly; useful for triaging spikes
+(filter `target_pct_of_frame > 1.0` to find frames where the layer ate
+more than 1 % of the budget).
 
 ### Real-time tracing (ETW)
 
