@@ -429,9 +429,9 @@ namespace openxr_api_layer {
                 << "# target_ms_mean=" << fmt::format("{:.4f}", target_ms_mean) << '\n'
                 << "# target_ms_min="  << fmt::format("{:.4f}", target_ms_min)  << '\n'
                 << "# target_ms_max="  << fmt::format("{:.4f}", target_ms_max)  << '\n'
-                << "# target_pct_mean=" << fmt::format("{:.4f}", target_pct_mean) << '\n'
-                << "# target_pct_min="  << fmt::format("{:.4f}", target_pct_min)  << '\n'
-                << "# target_pct_max="  << fmt::format("{:.4f}", target_pct_max)  << '\n';
+                << "# target_pct_mean=" << fmt::format("{:.4f}", target_pct_mean) << "%\n"
+                << "# target_pct_min="  << fmt::format("{:.4f}", target_pct_min)  << "%\n"
+                << "# target_pct_max="  << fmt::format("{:.4f}", target_pct_max)  << "%\n";
             out << "frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,"
                    "target_pct_of_frame\n";
             for (const auto& m : merged) {

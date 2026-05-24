@@ -201,9 +201,9 @@ def main() -> int:
         fh.write(f"# target_ms_mean={target_ms_mean:.4f}\n")
         fh.write(f"# target_ms_min={target_ms_min:.4f}\n")
         fh.write(f"# target_ms_max={target_ms_max:.4f}\n")
-        fh.write(f"# target_pct_mean={target_pct_mean:.4f}\n")
-        fh.write(f"# target_pct_min={target_pct_min:.4f}\n")
-        fh.write(f"# target_pct_max={target_pct_max:.4f}\n")
+        fh.write(f"# target_pct_mean={target_pct_mean:.4f}%\n")
+        fh.write(f"# target_pct_min={target_pct_min:.4f}%\n")
+        fh.write(f"# target_pct_max={target_pct_max:.4f}%\n")
         w = csv.writer(fh)
         w.writerow(["frame_idx", "thread_id", "frame_interval_us",
                     "pre_us", "post_us", "target_us", "target_pct_of_frame"])

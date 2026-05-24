@@ -143,9 +143,9 @@ or remove the two HKLM values manually.
    # target_ms_mean=0.0123
    # target_ms_min=0.0001
    # target_ms_max=0.3417
-   # target_pct_mean=0.111
-   # target_pct_min=0.0030
-   # target_pct_max=3.078
+   # target_pct_mean=0.1110%
+   # target_pct_min=0.0030%
+   # target_pct_max=3.0780%
    ```
 
    `frame_count` is the number of matched frames between pre and post.
