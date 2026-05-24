@@ -203,15 +203,16 @@ TEST_CASE("ComputeMerge: empty input gives empty output") {
 }
 
 TEST_CASE("ComputeMerge: single matched pair, no successor leaves interval blank") {
+    // qpc_freq=1MHz -> 1 tick = 1 us. Delta of 1000 ticks = 1000 us = 1 ms.
     const std::vector<RawFrameRow> pre = {Row(0, 1, 1'000, 2'000)};
     const std::vector<RawFrameRow> post = {Row(0, 1, 1'100, 1'900)};
     const auto m = ComputeMerge(pre, 1'000'000, post, 1'000'000);
     REQUIRE(m.size() == 1);
     CHECK(m[0].frame_idx == 0);
     CHECK(m[0].thread_id == 1);
-    CHECK(m[0].pre_us == doctest::Approx(1.0));
-    CHECK(m[0].post_us == doctest::Approx(0.8));
-    CHECK(m[0].target_us == doctest::Approx(0.2));
+    CHECK(m[0].pre_us == doctest::Approx(1000.0));
+    CHECK(m[0].post_us == doctest::Approx(800.0));
+    CHECK(m[0].target_us == doctest::Approx(200.0));
     CHECK_FALSE(m[0].frame_interval_us.has_value());
     CHECK_FALSE(m[0].target_pct_of_frame.has_value());
 }
