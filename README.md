@@ -121,12 +121,18 @@ or remove the two HKLM values manually.
 ### A first measurement
 
 1. Launch your OpenXR app normally. The two layers attach automatically
-   but stay **idle** until you press the hotkey -- they add zero overhead
-   to xrEndFrame in that state.
-2. Inside the app, press **Ctrl+F9** to start monitoring. The two DLLs
-   detect the keypress on their next xrEndFrame poll (~one frame of
-   latency) and begin recording. You will see a
-   "Monitoring STARTED" line in each side's `.log`.
+   but stay **idle** until you press the hotkey. While idle, each
+   xrEndFrame pays for two `GetAsyncKeyState` polls plus one atomic
+   exchange on the pre side, or a single atomic load on the post side
+   -- around 200 ns per side, well below the QPC noise floor.
+2. With the host app window **focused**, press **Ctrl+F9** to start
+   monitoring. The pre DLL detects the keypress and broadcasts the
+   new state to the post DLL through a small shared-memory segment;
+   both halves enter recording on the same xrEndFrame call. You will
+   see a "Monitoring STARTED" line in each side's `.log`. The hotkey
+   is ignored if any other window is foreground (Discord, browser,
+   IDE), so screenshot bindings on Ctrl+F9 in other apps do not
+   trigger the layer.
 3. Let the app run for **at least 30 seconds** of representative
    gameplay -- you want a steady-state sample, not the loading screen.
 4. Press **Ctrl+F9 again** to stop. The post DLL immediately drains both
@@ -290,9 +296,20 @@ and nothing per-frame. (The framework's logger takes a kernel-wide named
 mutex that can stall some compositors; per-frame info goes through ETW
 and the async CSV writer instead.)
 
-The per-side CSV is truncated when the writer thread starts, i.e. at
-every `xrCreateInstance`. The PID in the filename lets concurrent
-OpenXR processes coexist.
+The per-side CSV is truncated when the writer thread starts, i.e. on
+each Ctrl+F9 press that switches monitoring ON. The PID in the
+filename lets concurrent OpenXR processes coexist; the side suffix
+(`-pre` / `-post`) keeps the two halves distinct inside the shared
+folder.
+
+The first frame after a Ctrl+F9 start is intentionally **not**
+recorded -- it pays for the writer-thread spawn cost on the post
+side, which would otherwise land inside the pre bracket and inflate
+`target_us` for frame 0. The first row in the CSV is therefore the
+second-frame-after-start. The frame of the Ctrl+F9 **stop** press is
+also not recorded (the writer is already shut down by the time the
+record path would have appended), so the CSV row count is the number
+of frames strictly between start and stop.
 
 The merged CSV has a different schema -- seven `#` comment lines at
 the top with the session summary, then the column header, then one
@@ -370,10 +387,20 @@ the target layer's score.
   (Task Manager, crash, debugger detach) the per-side CSVs are still
   on disk (the writer flushes periodically), but no merged file is
   produced -- run `analyze.py` against the per-side files in that case.
-- **Hotkey conflict.** The hotkey is Ctrl+F9, polled via
-  `GetAsyncKeyState` from inside xrEndFrame. If the host app binds
-  Ctrl+F9 to something else, both will fire. Rebinding requires a
-  code change today.
+- **Stop press stalls the frame thread for the merge.** Pressing
+  Ctrl+F9 to stop joins both writer threads and runs MergeIntoOutput
+  synchronously inside `xrEndFrame` -- typically 10-50 ms for a
+  30-second session at 90 Hz. The user sees a 1-4 frame stutter on
+  the stop press. Acceptable for a user-initiated action; running
+  the merge on a background thread was rejected because the host
+  often exits within milliseconds of the stop and the file would be
+  lost.
+- **Hotkey conflict inside the host.** The hotkey is Ctrl+F9, polled
+  via `GetAsyncKeyState` from inside xrEndFrame. The poll is gated
+  by a `GetForegroundWindow` check so Ctrl+F9 in Discord, browser,
+  IDE, or any other app does NOT toggle the layer. But if the host
+  app itself binds Ctrl+F9 to something, both will fire. Rebinding
+  requires a code change today.
 - **64-bit only in the released CI artifacts.** A 32-bit target exists
   in the .vcxproj but is not currently tested.
 
