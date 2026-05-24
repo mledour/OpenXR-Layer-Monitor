@@ -123,63 +123,72 @@ or remove the two HKLM values manually.
 1. Launch your OpenXR app normally. The two layers attach automatically.
 2. Use the app for **at least 30 seconds**. The first frames are noisy
    from startup; you want a steady-state sample.
-3. Close the app cleanly (don't kill the process -- a clean shutdown
-   flushes the CSV write queue).
-4. Find the process ID your app ran under (Task Manager / Process
-   Explorer / a saved log file). Each run produces
-   `frames-<pid>-pre.csv` and `frames-<pid>-post.csv` side by side in
-   the layer's `%LOCALAPPDATA%` folder.
-5. Run the analyzer:
+3. Close the app cleanly. **A clean shutdown is what triggers the
+   auto-merge** -- on `xrDestroyInstance`, the post DLL reads both
+   per-side CSVs and writes a `frames-merged-<pid>.csv` next to them.
+   If the process is killed (Task Manager / crash) the per-side CSVs
+   are still on disk; you can run `analyze.py` manually to produce the
+   merged file.
+4. Open the merged CSV. It lives in:
 
-```powershell
-$dir = "$env:LOCALAPPDATA\XR_APILAYER_MLEDOUR_layer_monitor"
-python scripts\analyze.py "$dir\frames-<pid>-pre.csv" "$dir\frames-<pid>-post.csv"
-```
+   ```
+   %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\frames-merged-<pid>.csv
+   ```
 
-Example output:
+   One row per frame, with these columns:
 
-```
-matched frames: 1842
+   | column                  | meaning |
+   | ----------------------- | ------- |
+   | `frame_idx`             | matched index between pre and post |
+   | `thread_id`             | thread that called `xrEndFrame` |
+   | `frame_interval_us`     | wall-clock between this and the next frame's pre-entry (blank on the last row) |
+   | `pre_us`                | pre-side bracket = target + post + runtime |
+   | `post_us`               | post-side bracket = runtime |
+   | `target_us`             | `pre_us − post_us` -- the target layer's CPU cost |
+   | `target_pct_of_frame`   | `target_us / frame_interval_us * 100` (blank on the last row) |
 
-target_us          (microseconds):
-    count  1842
-    mean      12.34
-    median     8.10
-    p95       45.20
-    p99      128.40
-    min        0.30
-    max      341.70
+   Drop it into a spreadsheet / pandas / your plotting tool of choice.
+   The `target_pct_of_frame` column answers "what slice of the host's
+   frame budget did this layer eat" directly; useful for triaging
+   spikes (filter `target_pct_of_frame > 1.0` to find frames where the
+   layer ate more than 1 % of the budget).
 
-target_pct_of_frame (% of frame interval):
-    count  1841
-    mean      0.111
-    median    0.073
-    p95       0.407
-    p99       1.156
-    min       0.003
-    max       3.078
+5. **For stats at the command line**, run `scripts\analyze.py` against
+   the per-side CSVs (the script and the in-DLL merge produce the same
+   `frames-merged-<pid>.csv`; the script additionally prints mean /
+   median / p95 / p99 / max to stdout):
 
-frame_interval_us median: 11100.00  (~90.1 Hz)
-wrote frames-merged.csv
-```
+   ```powershell
+   $dir = "$env:LOCALAPPDATA\XR_APILAYER_MLEDOUR_layer_monitor"
+   python scripts\analyze.py "$dir\frames-<pid>-pre.csv" "$dir\frames-<pid>-post.csv"
+   ```
 
-`frames-merged.csv` has **one row per frame** with these columns:
+   Example output:
 
-| column                  | meaning |
-| ----------------------- | ------- |
-| `frame_idx`             | matched index between pre and post |
-| `thread_id`             | thread that called `xrEndFrame` |
-| `frame_interval_us`     | wall-clock between this and the next frame's pre-entry (blank on the last row) |
-| `pre_us`                | pre-side bracket = target + post + runtime |
-| `post_us`               | post-side bracket = runtime |
-| `target_us`             | `pre_us − post_us` -- the target layer's CPU cost |
-| `target_pct_of_frame`   | `target_us / frame_interval_us * 100` (blank on the last row) |
+   ```
+   matched frames: 1842
 
-Drop it into a spreadsheet / pandas / your plotting tool of choice. The
-`target_pct_of_frame` column answers "what slice of the host's frame
-budget did this layer eat" directly; useful for triaging spikes
-(filter `target_pct_of_frame > 1.0` to find frames where the layer ate
-more than 1 % of the budget).
+   target_us          (microseconds):
+       count  1842
+       mean      12.34
+       median     8.10
+       p95       45.20
+       p99      128.40
+       min        0.30
+       max      341.70
+
+   target_pct_of_frame (% of frame interval):
+       count  1841
+       mean      0.111
+       median    0.073
+       p95       0.407
+       p99       1.156
+       min       0.003
+       max       3.078
+
+   frame_interval_us median: 11100.00  (~90.1 Hz)
+   wrote frames-merged.csv
+   ```
 
 ### Real-time tracing (ETW)
 
@@ -221,6 +230,7 @@ per-side names so they coexist there; the per-frame CSVs carry a
     XR_APILAYER_MLEDOUR_layer_monitor_post.log
     frames-<pid>-pre.csv                           one row per xrEndFrame call
     frames-<pid>-post.csv
+    frames-merged-<pid>.csv                        auto-written by post on clean shutdown
 ```
 
 CSV format (header rows start with `#`):
@@ -291,6 +301,11 @@ the target layer's score.
 - **Process-lifetime CSV.** Each `xrCreateInstance` truncates the CSV.
   Probe-then-real init flows (OpenComposite, OXR-Toolkit) will overwrite
   the probe's data.
+- **Auto-merge requires clean shutdown.** The merged CSV is written from
+  the post DLL's `xrDestroyInstance` path. If the host process is killed
+  (Task Manager, crash, debugger detach) the per-side CSVs are still
+  flushed, but no merged file is produced -- run `analyze.py` against
+  the per-side files in that case.
 - **64-bit only in the released CI artifacts.** A 32-bit target exists
   in the .vcxproj but is not currently tested.
 

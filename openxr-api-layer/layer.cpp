@@ -59,6 +59,11 @@
 #include <log.h>
 #include <util.h>
 
+// pch.h pulls <unordered_map> but not <map>, which the auto-merge below uses
+// for its ordered-by-pair lookups (post index, next-entry per thread). Adding
+// the header here keeps the dependency local to the consumer.
+#include <map>
+
 namespace openxr_api_layer {
 
     using namespace log;
@@ -225,6 +230,182 @@ namespace openxr_api_layer {
 
         FrameCsvSink g_csv;
 
+        // ---- Auto-merge (post side only, on clean shutdown) ---------------
+        //
+        // After the post-side writer joins (end of g_csv.Stop()), both
+        // frames-<pid>-pre.csv and frames-<pid>-post.csv are fully flushed
+        // on disk because the OpenXR loader walks the destroy chain pre ->
+        // target -> post and the framework runs each layer's ResetInstance()
+        // BEFORE chaining downward (see framework/dispatch_generator.py's
+        // xrDestroyInstance template). So by the time post's OpenXrLayer
+        // destructor returns from Stop(), pre's destructor has already
+        // returned and pre's CSV is closed.
+        //
+        // We replicate analyze.py's logic here so the user gets a ready-to-
+        // open frames-merged-<pid>.csv next to the raw CSVs without having
+        // to run any post-processing. The script remains useful for stats
+        // and for sessions that didn't shut down cleanly (crash, kill -9):
+        // in that case no merge runs and the user falls back to analyze.py.
+        struct RawFrameRow {
+            uint64_t frame_idx;
+            uint32_t thread_id;
+            int64_t qpc_entry;
+            int64_t qpc_exit;
+        };
+
+        // Returns rows + qpc_freq parsed from the file's "# qpc_freq=" header.
+        // qpc_freq defaults to the process's own QPC frequency if the header
+        // is missing or unparseable.
+        std::pair<std::vector<RawFrameRow>, int64_t> ReadFrameCsv(
+            const std::filesystem::path& path) {
+            std::vector<RawFrameRow> rows;
+            int64_t freq = QpcFreqHz();
+            std::ifstream s(path);
+            if (!s) {
+                return {rows, freq};
+            }
+            std::string line;
+            bool header_consumed = false;
+            while (std::getline(s, line)) {
+                if (line.empty()) {
+                    continue;
+                }
+                if (line[0] == '#') {
+                    static const std::string kFreqKey = "qpc_freq=";
+                    if (const auto p = line.find(kFreqKey); p != std::string::npos) {
+                        try {
+                            freq = std::stoll(line.substr(p + kFreqKey.size()));
+                        } catch (...) {
+                            // keep default
+                        }
+                    }
+                    continue;
+                }
+                if (!header_consumed) {
+                    header_consumed = true;
+                    continue;
+                }
+                RawFrameRow r{};
+                char c;
+                std::stringstream ss(line);
+                if (ss >> r.frame_idx >> c >> r.thread_id >> c >> r.qpc_entry >> c >>
+                    r.qpc_exit) {
+                    rows.push_back(r);
+                }
+            }
+            return {rows, freq};
+        }
+
+        void MergeIntoOutput() {
+            namespace fs = std::filesystem;
+            const auto pid = GetCurrentProcessId();
+            const fs::path preCsv = localAppData / fmt::format("frames-{}-pre.csv", pid);
+            const fs::path postCsv =
+                localAppData / fmt::format("frames-{}-post.csv", pid);
+            const fs::path outCsv =
+                localAppData / fmt::format("frames-merged-{}.csv", pid);
+
+            auto [preRows, preFreq] = ReadFrameCsv(preCsv);
+            auto [postRows, postFreq] = ReadFrameCsv(postCsv);
+            if (preRows.empty() || postRows.empty()) {
+                Log(fmt::format("Skipping auto-merge: pre={} rows, post={} rows\n",
+                                preRows.size(), postRows.size()));
+                return;
+            }
+
+            using Key = std::pair<uint64_t, uint32_t>;
+            const auto mk = [](uint64_t fi, uint32_t tid) -> Key { return {fi, tid}; };
+
+            std::map<Key, RawFrameRow> postIndex;
+            for (const auto& r : postRows) {
+                postIndex[mk(r.frame_idx, r.thread_id)] = r;
+            }
+
+            // Frame interval comes from pre's qpc_entry deltas, per thread.
+            std::map<uint32_t, std::vector<std::pair<uint64_t, int64_t>>> preByThread;
+            for (const auto& r : preRows) {
+                preByThread[r.thread_id].emplace_back(r.frame_idx, r.qpc_entry);
+            }
+            for (auto& [tid, items] : preByThread) {
+                std::sort(items.begin(), items.end());
+            }
+            std::map<Key, int64_t> nextEntry;
+            for (const auto& [tid, items] : preByThread) {
+                for (size_t i = 0; i + 1 < items.size(); ++i) {
+                    nextEntry[mk(items[i].first, tid)] = items[i + 1].second;
+                }
+            }
+
+            struct MergedRow {
+                uint64_t frame_idx;
+                uint32_t thread_id;
+                std::optional<double> frame_interval_us;
+                double pre_us;
+                double post_us;
+                double target_us;
+                std::optional<double> target_pct_of_frame;
+            };
+            std::vector<MergedRow> merged;
+            merged.reserve(preRows.size());
+            for (const auto& pre : preRows) {
+                const auto it = postIndex.find(mk(pre.frame_idx, pre.thread_id));
+                if (it == postIndex.end()) {
+                    continue;
+                }
+                const auto& post = it->second;
+                MergedRow m{};
+                m.frame_idx = pre.frame_idx;
+                m.thread_id = pre.thread_id;
+                m.pre_us =
+                    static_cast<double>(pre.qpc_exit - pre.qpc_entry) / preFreq * 1e6;
+                m.post_us =
+                    static_cast<double>(post.qpc_exit - post.qpc_entry) / postFreq * 1e6;
+                m.target_us = m.pre_us - m.post_us;
+                if (const auto ne = nextEntry.find(mk(pre.frame_idx, pre.thread_id));
+                    ne != nextEntry.end()) {
+                    const double fiv =
+                        static_cast<double>(ne->second - pre.qpc_entry) / preFreq * 1e6;
+                    m.frame_interval_us = fiv;
+                    if (fiv > 0.0) {
+                        m.target_pct_of_frame = m.target_us / fiv * 100.0;
+                    }
+                }
+                merged.push_back(m);
+            }
+            // Deterministic output: thread, then frame_idx -- matches analyze.py.
+            std::sort(merged.begin(), merged.end(),
+                      [](const MergedRow& a, const MergedRow& b) {
+                          if (a.thread_id != b.thread_id) {
+                              return a.thread_id < b.thread_id;
+                          }
+                          return a.frame_idx < b.frame_idx;
+                      });
+
+            std::ofstream out(outCsv, std::ios::out | std::ios::trunc);
+            if (!out) {
+                ErrorLog(fmt::format("Failed to open merged output {}\n",
+                                     outCsv.string()));
+                return;
+            }
+            out << "frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,"
+                   "target_pct_of_frame\n";
+            for (const auto& m : merged) {
+                out << m.frame_idx << ',' << m.thread_id << ',';
+                if (m.frame_interval_us) {
+                    out << fmt::format("{:.3f}", *m.frame_interval_us);
+                }
+                out << ',' << fmt::format("{:.3f}", m.pre_us) << ','
+                    << fmt::format("{:.3f}", m.post_us) << ','
+                    << fmt::format("{:.3f}", m.target_us) << ',';
+                if (m.target_pct_of_frame) {
+                    out << fmt::format("{:.4f}", *m.target_pct_of_frame);
+                }
+                out << '\n';
+            }
+            Log(fmt::format("Wrote merged CSV: {} ({} frames)\n", outCsv.string(),
+                            merged.size()));
+        }
+
     } // namespace
 
     class OpenXrLayer : public OpenXrApi {
@@ -234,9 +415,14 @@ namespace openxr_api_layer {
         // ResetInstance() (called from xrDestroyInstance) destroys this
         // OpenXrLayer while the process is still alive. We tear down the
         // writer here so the trailing rows make it to disk before the
-        // DLL unloads.
+        // DLL unloads, then -- on the post side only -- merge the pre and
+        // post CSVs into frames-merged-<pid>.csv so the user doesn't have
+        // to run analyze.py for the common case.
         ~OpenXrLayer() override {
             g_csv.Stop();
+            if constexpr (kIsPostSide) {
+                MergeIntoOutput();
+            }
         }
 
         XrResult xrCreateInstance(const XrInstanceCreateInfo* createInfo) override {
