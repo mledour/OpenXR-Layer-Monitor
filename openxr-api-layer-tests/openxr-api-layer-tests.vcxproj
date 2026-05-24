@@ -135,6 +135,8 @@
          files here — see test_example.cpp for the doctest pattern. -->
     <ClCompile Include="main.cpp" />
     <ClCompile Include="test_example.cpp" />
+    <ClCompile Include="test_merge.cpp" />
+    <ClCompile Include="test_integration.cpp" />
     <ClCompile Include="mock_runtime.cpp" />
     <ClCompile Include="test_stubs.cpp" />
     <!-- Layer sources we link into the test binary. These define the
@@ -144,16 +146,16 @@
          (which talks to the OpenXR loader) — those are loader-only
          code. The stubs in test_stubs.cpp cover the data symbols
          entry.cpp normally defines (dllHome, localAppData,
-         log::logStream).
-         Add ..\openxr-api-layer\utils\*.cpp entries below as you grow
-         your layer with more .cpp files. -->
+         log::logStream). -->
     <ClCompile Include="..\openxr-api-layer\layer.cpp" />
     <ClCompile Include="..\openxr-api-layer\framework\dispatch.gen.cpp" />
     <ClCompile Include="..\openxr-api-layer\framework\log.cpp" />
+    <ClCompile Include="..\openxr-api-layer\utils\merge.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="external\doctest\doctest.h" />
     <ClInclude Include="mock_runtime.h" />
+    <ClInclude Include="..\openxr-api-layer\utils\merge.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

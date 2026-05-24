@@ -201,7 +201,7 @@ jobs:
       # which side they were "linked" with -- the test vcxproj's hardcoded
       # LAYER_NAME just controls layer.cpp's side detection inside the test
       # binary, which is irrelevant to current unit tests.
-      - name: Run unit + integration tests (${{ matrix.configuration }} | x64)
+      - name: Run unit + integration tests (C++, ${{ matrix.configuration }} | x64)
         shell: pwsh
         run: |
           $exe = "bin\x64\${{ matrix.configuration }}\openxr-api-layer-tests.exe"
@@ -211,6 +211,22 @@ jobs:
           & $exe --reporters=console --force-colors
           if ($LASTEXITCODE -ne 0) {
             throw "openxr-api-layer-tests.exe returned $LASTEXITCODE"
+          }
+
+      # Python analyzer tests. Only run once per matrix entry (the script
+      # itself is configuration-agnostic, but running in both Release and
+      # Debug matrix shards is cheap and catches any pytest-vs-Python-
+      # version surprise that might land on the Debug runner). Skip on
+      # Win32: the analyzer is platform-agnostic but the matrix only
+      # builds x64 anyway.
+      - name: Run analyzer tests (Python)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pytest scripts/test_analyze.py -v
+          if ($LASTEXITCODE -ne 0) {
+            throw "pytest scripts/test_analyze.py returned $LASTEXITCODE"
           }
 
       # ---- Inno Setup installer (Release only) --------------------------
