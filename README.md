@@ -135,7 +135,22 @@ or remove the two HKLM values manually.
    %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\frames-merged-<pid>.csv
    ```
 
-   One row per frame, with these columns:
+   The top three lines are a session-wide summary (also greppable from
+   the shell):
+
+   ```
+   # frame_count=1842
+   # target_ms_mean=0.0123
+   # target_pct_mean=0.111
+   ```
+
+   `frame_count` is the number of matched frames between pre and post,
+   `target_ms_mean` is the average CPU cost the target layer added per
+   frame (in milliseconds), `target_pct_mean` is that cost expressed as
+   a percentage of the host's frame interval -- averaged over the
+   frames that have a successor (every frame except the last per thread).
+
+   Below the summary, one row per frame with these columns:
 
    | column                  | meaning |
    | ----------------------- | ------- |

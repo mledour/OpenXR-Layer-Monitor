@@ -381,12 +381,37 @@ namespace openxr_api_layer {
                           return a.frame_idx < b.frame_idx;
                       });
 
+            // Session-wide summary written as comment headers at the top of
+            // the merged CSV. Three numbers the user usually wants without
+            // having to open a spreadsheet: total frames matched, mean CPU
+            // ms attributed to the target, mean % of frame budget eaten.
+            // Frames with no successor (last frame per thread) contribute
+            // to frame_count and target_ms_mean but NOT to target_pct_mean
+            // (their target_pct_of_frame is undefined).
+            double target_ms_sum = 0.0;
+            double target_pct_sum = 0.0;
+            size_t pct_count = 0;
+            for (const auto& m : merged) {
+                target_ms_sum += m.target_us / 1000.0;
+                if (m.target_pct_of_frame) {
+                    target_pct_sum += *m.target_pct_of_frame;
+                    ++pct_count;
+                }
+            }
+            const double target_ms_mean =
+                merged.empty() ? 0.0 : target_ms_sum / merged.size();
+            const double target_pct_mean =
+                pct_count == 0 ? 0.0 : target_pct_sum / pct_count;
+
             std::ofstream out(outCsv, std::ios::out | std::ios::trunc);
             if (!out) {
                 ErrorLog(fmt::format("Failed to open merged output {}\n",
                                      outCsv.string()));
                 return;
             }
+            out << "# frame_count=" << merged.size() << '\n'
+                << "# target_ms_mean=" << fmt::format("{:.4f}", target_ms_mean) << '\n'
+                << "# target_pct_mean=" << fmt::format("{:.4f}", target_pct_mean) << '\n';
             out << "frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,"
                    "target_pct_of_frame\n";
             for (const auto& m : merged) {
