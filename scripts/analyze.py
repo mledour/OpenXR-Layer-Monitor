@@ -184,18 +184,26 @@ def main() -> int:
               file=sys.stderr)
 
     # Header lines at the top of the merged CSV -- byte-equivalent to what
-    # the in-DLL merge in layer.cpp emits, so users get the same three
-    # session-summary numbers regardless of which path produced the file.
-    # pct_mean excludes the last frame per thread (no successor -> no
-    # interval -> no pct), matching the C++ merge.
+    # the in-DLL merge in layer.cpp emits, so users get the same summary
+    # numbers regardless of which path produced the file. pct_* excludes
+    # the last frame per thread (no successor -> no interval -> no pct),
+    # matching the C++ merge.
     target_ms_values = [v / 1000.0 for v in target_values]
     target_ms_mean = statistics.fmean(target_ms_values) if target_ms_values else 0.0
+    target_ms_min = min(target_ms_values) if target_ms_values else 0.0
+    target_ms_max = max(target_ms_values) if target_ms_values else 0.0
     target_pct_mean = statistics.fmean(pct_values) if pct_values else 0.0
+    target_pct_min = min(pct_values) if pct_values else 0.0
+    target_pct_max = max(pct_values) if pct_values else 0.0
 
     with args.out.open("w", newline="", encoding="utf-8") as fh:
         fh.write(f"# frame_count={len(merged)}\n")
         fh.write(f"# target_ms_mean={target_ms_mean:.4f}\n")
+        fh.write(f"# target_ms_min={target_ms_min:.4f}\n")
+        fh.write(f"# target_ms_max={target_ms_max:.4f}\n")
         fh.write(f"# target_pct_mean={target_pct_mean:.4f}\n")
+        fh.write(f"# target_pct_min={target_pct_min:.4f}\n")
+        fh.write(f"# target_pct_max={target_pct_max:.4f}\n")
         w = csv.writer(fh)
         w.writerow(["frame_idx", "thread_id", "frame_interval_us",
                     "pre_us", "post_us", "target_us", "target_pct_of_frame"])
