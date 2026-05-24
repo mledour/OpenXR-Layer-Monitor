@@ -135,7 +135,38 @@ or remove the two HKLM values manually.
    %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\frames-merged-<pid>.csv
    ```
 
-   One row per frame, with these columns:
+   The top seven lines are a session-wide summary (also greppable from
+   the shell):
+
+   ```
+   # frame_count=1842
+   # target_ms_mean=0.0123
+   # target_ms_min=0.0001
+   # target_ms_max=0.3417
+   # target_pct_mean=0.1110%
+   # target_pct_min=0.0030%
+   # target_pct_max=3.0780%
+   ```
+
+   `frame_count` is the number of matched frames between pre and post.
+   `target_ms_*` is the CPU cost the target layer added per frame, in
+   milliseconds. `target_pct_*` is that cost expressed as a percentage
+   of the host's frame interval. The min / max bound the variability:
+   useful for spotting bursty or sparse layers where the mean dilutes
+   the actual per-call cost. `target_pct_*` aggregates only over frames
+   that have a successor (every frame except the last per thread).
+
+   **`target_ms_min` can be negative.** `target_us = pre_us - post_us`
+   and QPC jitter occasionally pushes the post-side bracket slightly
+   above the pre-side one, especially for layers whose own cost is
+   below the QPC noise floor (~hundreds of nanoseconds). The data is
+   real -- not clamped -- and the post DLL writes a count of
+   negative-`target_us` frames to its `.log` file when this happens.
+   For a layer with single-digit-µs mean cost, a small negative min
+   is normal noise; a large negative min hints at counter desync or a
+   broken layer chain.
+
+   Below the summary, one row per frame with these columns:
 
    | column                  | meaning |
    | ----------------------- | ------- |
@@ -251,9 +282,31 @@ and nothing per-frame. (The framework's logger takes a kernel-wide named
 mutex that can stall some compositors; per-frame info goes through ETW
 and the async CSV writer instead.)
 
-The CSV is truncated when the writer thread starts, i.e. at every
-`xrCreateInstance`. The PID in the filename lets concurrent OpenXR
-processes coexist.
+The per-side CSV is truncated when the writer thread starts, i.e. at
+every `xrCreateInstance`. The PID in the filename lets concurrent
+OpenXR processes coexist.
+
+The merged CSV has a different schema -- seven `#` comment lines at
+the top with the session summary, then the column header, then one
+row per matched frame:
+
+```
+# frame_count=<int>
+# target_ms_mean=<float>             ms
+# target_ms_min=<float>              ms (may be negative -- see below)
+# target_ms_max=<float>              ms
+# target_pct_mean=<float>%           percentage of frame interval
+# target_pct_min=<float>%            percentage of frame interval
+# target_pct_max=<float>%            percentage of frame interval
+frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,target_pct_of_frame
+<int>,<int>,<float>,<float>,<float>,<float>,<float>
+...
+```
+
+All `#`-prefixed values are bare numbers (no unit) except
+`target_pct_*` which carries a literal `%` after the value for
+visual clarity. All line endings are LF (the C++ writer opens the
+file in binary mode, the Python writer uses `lineterminator='\n'`).
 
 ## How it works
 

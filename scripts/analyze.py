@@ -4,7 +4,11 @@ emit one row per frame with the target layer's CPU cost both in microseconds
 and as a percentage of the host's per-frame wall-clock budget.
 
 Usage:
-    python analyze.py <pre.csv> <post.csv> [--out frames-merged.csv]
+    python analyze.py <pre.csv> <post.csv> [--out OUT]
+
+By default --out is `frames-merged-<pid>.csv` next to the inputs (the PID
+is extracted from the `frames-<pid>-pre.csv` naming convention), matching
+the path the in-DLL auto-merge writes to.
 
 Math:
     pre_us            = (pre_exit  - pre_entry)  / qpc_freq * 1e6
@@ -27,10 +31,13 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import re
 import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+RAW_COLUMNS = ("frame_idx", "thread_id", "qpc_entry", "qpc_exit")
 
 
 @dataclass
@@ -55,6 +62,17 @@ def load(path: Path) -> Frames:
                 meta[key.strip()] = value.strip()
                 continue
             if not header_found:
+                # The raw per-side CSV has exactly four columns. A user
+                # passing the merged CSV by mistake (seven columns,
+                # starts with frame_idx,thread_id,frame_interval_us...)
+                # would otherwise crash with an obscure ValueError on
+                # int("11100.000"). Catch it here with a clear message.
+                if tuple(raw) != RAW_COLUMNS:
+                    raise SystemExit(
+                        f"{path}: unexpected column header {raw!r}, "
+                        f"expected {list(RAW_COLUMNS)!r}. Did you pass "
+                        f"the merged CSV instead of a per-side one?"
+                    )
                 header_found = True
                 continue
             rows.append((int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3])))
@@ -63,6 +81,19 @@ def load(path: Path) -> Frames:
         qpc_freq=int(meta.get("qpc_freq", "10000000")),
         rows=rows,
     )
+
+
+def default_out_path(pre_path: Path) -> Path:
+    """Pick the merged-CSV path that mirrors the in-DLL output naming.
+
+    `frames-<pid>-pre.csv` -> `frames-merged-<pid>.csv` next to it. Falls
+    back to `frames-merged.csv` in the CWD if the input doesn't follow
+    that convention.
+    """
+    m = re.match(r"frames-(\d+)-pre\.csv$", pre_path.name)
+    if m:
+        return pre_path.parent / f"frames-merged-{m.group(1)}.csv"
+    return Path("frames-merged.csv")
 
 
 def percentile(sorted_values: list[float], pct: float) -> float:
@@ -93,11 +124,14 @@ def print_stats(label: str, values: list[float], unit: str, fmt: str = "8.2f") -
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("pre", type=Path, help="pre-side frames-<pid>.csv")
-    ap.add_argument("post", type=Path, help="post-side frames-<pid>.csv")
-    ap.add_argument("--out", type=Path, default=Path("frames-merged.csv"),
-                    help="merged per-frame output (default: frames-merged.csv)")
+    ap.add_argument("pre", type=Path, help="pre-side frames-<pid>-pre.csv")
+    ap.add_argument("post", type=Path, help="post-side frames-<pid>-post.csv")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="merged per-frame output "
+                         "(default: frames-merged-<pid>.csv alongside the inputs)")
     args = ap.parse_args()
+    if args.out is None:
+        args.out = default_out_path(args.pre)
 
     pre = load(args.pre)
     post = load(args.post)
@@ -183,8 +217,33 @@ def main() -> int:
               f"(post bracket > pre bracket -- noise floor / counter jitter)",
               file=sys.stderr)
 
+    # Header lines at the top of the merged CSV -- byte-equivalent to what
+    # the in-DLL merge in layer.cpp emits, so users get the same summary
+    # numbers regardless of which path produced the file. pct_* excludes
+    # the last frame per thread (no successor -> no interval -> no pct),
+    # matching the C++ merge.
+    target_ms_values = [v / 1000.0 for v in target_values]
+    target_ms_mean = statistics.fmean(target_ms_values) if target_ms_values else 0.0
+    target_ms_min = min(target_ms_values) if target_ms_values else 0.0
+    target_ms_max = max(target_ms_values) if target_ms_values else 0.0
+    target_pct_mean = statistics.fmean(pct_values) if pct_values else 0.0
+    target_pct_min = min(pct_values) if pct_values else 0.0
+    target_pct_max = max(pct_values) if pct_values else 0.0
+
+    # newline="" disables the file object's translation; lineterminator='\n'
+    # disables csv.writer's default '\r\n'. Together they keep the output
+    # LF-only on every platform, matching the C++ merge (binary mode + '\n')
+    # so frames-merged-<pid>.csv is byte-equivalent regardless of which
+    # path produced it.
     with args.out.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
+        fh.write(f"# frame_count={len(merged)}\n")
+        fh.write(f"# target_ms_mean={target_ms_mean:.4f}\n")
+        fh.write(f"# target_ms_min={target_ms_min:.4f}\n")
+        fh.write(f"# target_ms_max={target_ms_max:.4f}\n")
+        fh.write(f"# target_pct_mean={target_pct_mean:.4f}%\n")
+        fh.write(f"# target_pct_min={target_pct_min:.4f}%\n")
+        fh.write(f"# target_pct_max={target_pct_max:.4f}%\n")
+        w = csv.writer(fh, lineterminator="\n")
         w.writerow(["frame_idx", "thread_id", "frame_interval_us",
                     "pre_us", "post_us", "target_us", "target_pct_of_frame"])
         for fi, tid, fiv, pu, postu, tu, pct in merged:

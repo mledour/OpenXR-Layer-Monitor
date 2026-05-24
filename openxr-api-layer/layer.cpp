@@ -307,9 +307,26 @@ namespace openxr_api_layer {
 
             auto [preRows, preFreq] = ReadFrameCsv(preCsv);
             auto [postRows, postFreq] = ReadFrameCsv(postCsv);
+            // Helper: a previous session that wrote stats then failed mid-run
+            // (or the OS recycling our PID for an unrelated process) would
+            // leave a frames-merged-<pid>.csv on disk with stale numbers in
+            // its header. Wipe it on every skip path so head -7 never lies.
+            //
+            // Tradeoff: a short test run that records zero frames AFTER an
+            // earlier real session with the same PID will also wipe the
+            // earlier merged file. We accept this -- a stale header with
+            // authoritative-looking stats is more dangerous than losing a
+            // recently-superseded file, and the per-side CSVs are also
+            // truncated at the new session's xrCreateInstance so the data
+            // is gone either way.
+            const auto removeStale = [&] {
+                std::error_code ec;
+                std::filesystem::remove(outCsv, ec);
+            };
             if (preRows.empty() || postRows.empty()) {
                 Log(fmt::format("Skipping auto-merge: pre={} rows, post={} rows\n",
                                 preRows.size(), postRows.size()));
+                removeStale();
                 return;
             }
 
@@ -373,31 +390,111 @@ namespace openxr_api_layer {
                 merged.push_back(m);
             }
             // Deterministic output: thread, then frame_idx -- matches analyze.py.
-            std::sort(merged.begin(), merged.end(),
-                      [](const MergedRow& a, const MergedRow& b) {
-                          if (a.thread_id != b.thread_id) {
-                              return a.thread_id < b.thread_id;
-                          }
-                          return a.frame_idx < b.frame_idx;
-                      });
+            // stable_sort defends against a future change that lets duplicate
+            // (thread, frame_idx) keys through (today postIndex dedupes them
+            // via std::map, but a refactor could break that invariant).
+            std::stable_sort(merged.begin(), merged.end(),
+                             [](const MergedRow& a, const MergedRow& b) {
+                                 if (a.thread_id != b.thread_id) {
+                                     return a.thread_id < b.thread_id;
+                                 }
+                                 return a.frame_idx < b.frame_idx;
+                             });
 
-            std::ofstream out(outCsv, std::ios::out | std::ios::trunc);
+            if (merged.empty()) {
+                Log("Skipping auto-merge: no matched (frame_idx, thread_id) "
+                    "pairs between pre and post\n");
+                removeStale();
+                return;
+            }
+
+            // Session-wide summary written as comment headers at the top of
+            // the merged CSV. Mean catches the average cost; min/max bound
+            // the variability so users profiling unknown layers (toolkits,
+            // mods, anti-cheat hooks) spot bursty / sparse behaviour the
+            // mean would dilute. Frames with no successor (last frame per
+            // thread) contribute to frame_count and target_ms_* but NOT to
+            // target_pct_* (their target_pct_of_frame is undefined).
+            std::vector<double> ms_values;
+            std::vector<double> pct_values;
+            ms_values.reserve(merged.size());
+            pct_values.reserve(merged.size());
+            for (const auto& m : merged) {
+                ms_values.push_back(m.target_us / 1000.0);
+                if (m.target_pct_of_frame.has_value()) {
+                    pct_values.push_back(*m.target_pct_of_frame);
+                }
+            }
+            // The *WhenEmpty suffix says exactly what the fallback is for:
+            // none of these clamp to zero on populated input -- e.g. min
+            // can legitimately be negative when QPC jitter pushes
+            // pre_us below post_us, see the negative-frame warning below.
+            const auto meanOrZeroWhenEmpty = [](const std::vector<double>& v) {
+                if (v.empty()) return 0.0;
+                double s = 0.0;
+                for (double x : v) s += x;
+                return s / v.size();
+            };
+            const auto minOrZeroWhenEmpty = [](const std::vector<double>& v) {
+                return v.empty() ? 0.0
+                                 : *std::min_element(v.begin(), v.end());
+            };
+            const auto maxOrZeroWhenEmpty = [](const std::vector<double>& v) {
+                return v.empty() ? 0.0
+                                 : *std::max_element(v.begin(), v.end());
+            };
+            const double target_ms_mean = meanOrZeroWhenEmpty(ms_values);
+            const double target_ms_min = minOrZeroWhenEmpty(ms_values);
+            const double target_ms_max = maxOrZeroWhenEmpty(ms_values);
+            const double target_pct_mean = meanOrZeroWhenEmpty(pct_values);
+            const double target_pct_min = minOrZeroWhenEmpty(pct_values);
+            const double target_pct_max = maxOrZeroWhenEmpty(pct_values);
+
+            // target_us = pre_us - post_us can be negative when QPC noise
+            // pushes post's bracket slightly above pre's. The data is real
+            // (we don't clamp it -- the user might want to see how often
+            // it happens for a given target). Surface a count in the .log
+            // so users don't get surprised by a negative min in the header.
+            if (target_ms_min < 0.0) {
+                const size_t negative = static_cast<size_t>(
+                    std::count_if(ms_values.begin(), ms_values.end(),
+                                  [](double x) { return x < 0.0; }));
+                Log(fmt::format(
+                    "note: {} of {} frames have negative target_us "
+                    "(QPC jitter / noise floor)\n",
+                    negative, ms_values.size()));
+            }
+
+            // Binary mode keeps line endings LF-only on every platform.
+            // Without it, MSVC opens text mode and translates each '\n'
+            // to "\r\n", which makes the C++ output diverge byte-for-byte
+            // from analyze.py's (Python writes LF when newline='' is set).
+            std::ofstream out(outCsv,
+                              std::ios::out | std::ios::trunc | std::ios::binary);
             if (!out) {
                 ErrorLog(fmt::format("Failed to open merged output {}\n",
                                      outCsv.string()));
+                removeStale();
                 return;
             }
+            out << "# frame_count=" << merged.size() << '\n'
+                << "# target_ms_mean=" << fmt::format("{:.4f}", target_ms_mean) << '\n'
+                << "# target_ms_min="  << fmt::format("{:.4f}", target_ms_min)  << '\n'
+                << "# target_ms_max="  << fmt::format("{:.4f}", target_ms_max)  << '\n'
+                << "# target_pct_mean=" << fmt::format("{:.4f}", target_pct_mean) << "%\n"
+                << "# target_pct_min="  << fmt::format("{:.4f}", target_pct_min)  << "%\n"
+                << "# target_pct_max="  << fmt::format("{:.4f}", target_pct_max)  << "%\n";
             out << "frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,"
                    "target_pct_of_frame\n";
             for (const auto& m : merged) {
                 out << m.frame_idx << ',' << m.thread_id << ',';
-                if (m.frame_interval_us) {
+                if (m.frame_interval_us.has_value()) {
                     out << fmt::format("{:.3f}", *m.frame_interval_us);
                 }
                 out << ',' << fmt::format("{:.3f}", m.pre_us) << ','
                     << fmt::format("{:.3f}", m.post_us) << ','
                     << fmt::format("{:.3f}", m.target_us) << ',';
-                if (m.target_pct_of_frame) {
+                if (m.target_pct_of_frame.has_value()) {
                     out << fmt::format("{:.4f}", *m.target_pct_of_frame);
                 }
                 out << '\n';
@@ -421,7 +518,17 @@ namespace openxr_api_layer {
         ~OpenXrLayer() override {
             g_csv.Stop();
             if constexpr (kIsPostSide) {
-                MergeIntoOutput();
+                // Best-practices rule 9: never crash the host. fmt::format,
+                // std::ofstream, and filesystem ops can all throw; an
+                // exception escaping a destructor calls std::terminate
+                // which would take the game down at xrDestroyInstance time.
+                try {
+                    MergeIntoOutput();
+                } catch (const std::exception& e) {
+                    ErrorLog(fmt::format("Merge failed: {}\n", e.what()));
+                } catch (...) {
+                    ErrorLog("Merge failed: unknown exception\n");
+                }
             }
         }
 
