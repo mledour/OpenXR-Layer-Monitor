@@ -120,16 +120,24 @@ or remove the two HKLM values manually.
 
 ### A first measurement
 
-1. Launch your OpenXR app normally. The two layers attach automatically.
-2. Use the app for **at least 30 seconds**. The first frames are noisy
-   from startup; you want a steady-state sample.
-3. Close the app cleanly. **A clean shutdown is what triggers the
-   auto-merge** -- on `xrDestroyInstance`, the post DLL reads both
-   per-side CSVs and writes a `frames-merged-<pid>.csv` next to them.
-   If the process is killed (Task Manager / crash) the per-side CSVs
-   are still on disk; you can run `analyze.py` manually to produce the
-   merged file.
-4. Open the merged CSV. It lives in:
+1. Launch your OpenXR app normally. The two layers attach automatically
+   but stay **idle** until you press the hotkey -- they add zero overhead
+   to xrEndFrame in that state.
+2. Inside the app, press **Ctrl+F9** to start monitoring. The two DLLs
+   detect the keypress on their next xrEndFrame poll (~one frame of
+   latency) and begin recording. You will see a
+   "Monitoring STARTED" line in each side's `.log`.
+3. Let the app run for **at least 30 seconds** of representative
+   gameplay -- you want a steady-state sample, not the loading screen.
+4. Press **Ctrl+F9 again** to stop. The post DLL immediately drains both
+   writers and produces `frames-merged-<pid>.csv` while the app is still
+   running. You can press Ctrl+F9 a third time to start a fresh session
+   (the previous merge is overwritten).
+5. If you forget step 4 and just quit the app: the auto-merge falls back
+   to `xrDestroyInstance`, so you still get the merged CSV. If the
+   process is killed hard (Task Manager / crash) you only get the
+   per-side CSVs and need `analyze.py` to merge them manually.
+6. Open the merged CSV. It lives in:
 
    ```
    %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\frames-merged-<pid>.csv
@@ -184,7 +192,7 @@ or remove the two HKLM values manually.
    spikes (filter `target_pct_of_frame > 1.0` to find frames where the
    layer ate more than 1 % of the budget).
 
-5. **For stats at the command line**, run `scripts\analyze.py` against
+7. **For stats at the command line**, run `scripts\analyze.py` against
    the per-side CSVs (the script and the in-DLL merge produce the same
    `frames-merged-<pid>.csv`; the script additionally prints mean /
    median / p95 / p99 / max to stdout):
@@ -259,9 +267,9 @@ per-side names so they coexist there; the per-frame CSVs carry a
 %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\
     XR_APILAYER_MLEDOUR_layer_monitor_pre.log     init log (app name, runtime, QPC freq)
     XR_APILAYER_MLEDOUR_layer_monitor_post.log
-    frames-<pid>-pre.csv                           one row per xrEndFrame call
+    frames-<pid>-pre.csv                           one row per xrEndFrame call (truncated on each Ctrl+F9 start)
     frames-<pid>-post.csv
-    frames-merged-<pid>.csv                        auto-written by post on clean shutdown
+    frames-merged-<pid>.csv                        auto-written by post on Ctrl+F9 stop or xrDestroyInstance fallback
 ```
 
 CSV format (header rows start with `#`):
@@ -351,14 +359,21 @@ the target layer's score.
 - **The post-side writer is invisible to the math but visible on the
   wall clock.** Frame budget impact at 90 Hz with a ~256-entry queue is
   below 0.1 % in practice; it does not bias `target_us`.
-- **Process-lifetime CSV.** Each `xrCreateInstance` truncates the CSV.
-  Probe-then-real init flows (OpenComposite, OXR-Toolkit) will overwrite
-  the probe's data.
-- **Auto-merge requires clean shutdown.** The merged CSV is written from
-  the post DLL's `xrDestroyInstance` path. If the host process is killed
+- **Per-session CSV.** The per-side CSVs are truncated each time you
+  press Ctrl+F9 to start a new monitoring session. The previous merged
+  CSV is overwritten on the next Ctrl+F9 stop (or at xrDestroyInstance).
+  If you want to keep an older session, move the file out before the
+  next start.
+- **Auto-merge requires a clean stop.** The merged CSV is written when
+  the user presses Ctrl+F9 to stop or when xrDestroyInstance fires
+  while still monitoring. If the host process is killed mid-session
   (Task Manager, crash, debugger detach) the per-side CSVs are still
-  flushed, but no merged file is produced -- run `analyze.py` against
-  the per-side files in that case.
+  on disk (the writer flushes periodically), but no merged file is
+  produced -- run `analyze.py` against the per-side files in that case.
+- **Hotkey conflict.** The hotkey is Ctrl+F9, polled via
+  `GetAsyncKeyState` from inside xrEndFrame. If the host app binds
+  Ctrl+F9 to something else, both will fire. Rebinding requires a
+  code change today.
 - **64-bit only in the released CI artifacts.** A 32-bit target exists
   in the .vcxproj but is not currently tested.
 

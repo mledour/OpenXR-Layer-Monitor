@@ -118,6 +118,31 @@ namespace openxr_api_layer {
         // mismatch via the per-side row count.
         std::atomic<uint64_t> g_frameCounter{0};
 
+        // ---- Hotkey toggle (Ctrl+F9) ---------------------------------------
+        //
+        // Monitoring is OFF by default. The user starts/stops it with Ctrl+F9
+        // pressed inside the host app. xrEndFrame polls GetAsyncKeyState every
+        // frame -- no Windows hook, no extra thread, just a kernel poll
+        // (~100 ns), so it is anti-cheat-friendly. Rising-edge detection makes
+        // sure holding the combo only fires once.
+        //
+        // Pre and post each own their own atomics. The chain pre -> target ->
+        // post runs synchronously inside one host xrEndFrame call, so both
+        // halves see the same combo down/up state on the same frame and toggle
+        // in lockstep. The only failure mode -- the user releasing the combo
+        // between pre's poll and post's poll -- is physically impossible for a
+        // human keypress (microseconds apart).
+        std::atomic<bool> g_monitoring{false};
+        std::atomic<bool> g_lastComboDown{false};
+
+        bool PollHotkeyEdge() {
+            const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            const bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+            const bool down = ctrl && f9;
+            const bool prev = g_lastComboDown.exchange(down);
+            return down && !prev;
+        }
+
         // ---- Background CSV writer -----------------------------------------
         //
         // The frame thread does the cheapest possible thing: take a brief
@@ -503,6 +528,46 @@ namespace openxr_api_layer {
                             merged.size()));
         }
 
+        // ---- Hotkey toggle action -----------------------------------------
+        //
+        // Called from xrEndFrame when PollHotkeyEdge() returns true. Flips
+        // g_monitoring, resets the per-session frame counter, and either
+        // spins the writer up (toggle ON) or stops it + triggers the merge
+        // (toggle OFF, post side). Pre's writer is guaranteed to be drained
+        // by the time post runs MergeIntoOutput because the chain order
+        // pre -> target -> post means pre's ToggleMonitoring() has already
+        // returned (and joined its writer) when post enters xrEndFrame.
+        void ToggleMonitoring() {
+            const bool was_on = g_monitoring.load(std::memory_order_acquire);
+            g_monitoring.store(!was_on, std::memory_order_release);
+            if (!was_on) {
+                Log(fmt::format(
+                    "Monitoring STARTED on side='{}' (Ctrl+F9 pressed)\n",
+                    kSideStr));
+                g_frameCounter.store(0, std::memory_order_relaxed);
+                g_csv.Start();
+            } else {
+                Log(fmt::format(
+                    "Monitoring STOPPED on side='{}' (Ctrl+F9 pressed)\n",
+                    kSideStr));
+                g_csv.Stop();  // blocking drain + close per-side CSV
+                if constexpr (kIsPostSide) {
+                    // See ~OpenXrLayer for why we wrap MergeIntoOutput in a
+                    // catch-all: same rationale here, except we're inside
+                    // xrEndFrame on the frame thread instead of in a
+                    // destructor. An exception would unwind back into the
+                    // game's xrEndFrame caller, which is just as bad.
+                    try {
+                        MergeIntoOutput();
+                    } catch (const std::exception& e) {
+                        ErrorLog(fmt::format("Merge failed: {}\n", e.what()));
+                    } catch (...) {
+                        ErrorLog("Merge failed: unknown exception\n");
+                    }
+                }
+            }
+        }
+
     } // namespace
 
     class OpenXrLayer : public OpenXrApi {
@@ -510,12 +575,17 @@ namespace openxr_api_layer {
         OpenXrLayer() = default;
 
         // ResetInstance() (called from xrDestroyInstance) destroys this
-        // OpenXrLayer while the process is still alive. We tear down the
-        // writer here so the trailing rows make it to disk before the
-        // DLL unloads, then -- on the post side only -- merge the pre and
-        // post CSVs into frames-merged-<pid>.csv so the user doesn't have
-        // to run analyze.py for the common case.
+        // OpenXrLayer while the process is still alive. If the user is
+        // still in a monitoring session (didn't press Ctrl+F9 to stop),
+        // wrap things up automatically -- otherwise the toggle-OFF path
+        // already did the merge and there is nothing left to do here.
         ~OpenXrLayer() override {
+            if (!g_monitoring.load(std::memory_order_acquire)) {
+                // Either: user pressed Ctrl+F9 to stop, and the merge
+                // already happened on that toggle; or: user never started
+                // a session, and there is nothing to merge.
+                return;
+            }
             g_csv.Stop();
             if constexpr (kIsPostSide) {
                 // Best-practices rule 9: never crash the host. fmt::format,
@@ -530,6 +600,7 @@ namespace openxr_api_layer {
                     ErrorLog("Merge failed: unknown exception\n");
                 }
             }
+            g_monitoring.store(false, std::memory_order_release);
         }
 
         XrResult xrCreateInstance(const XrInstanceCreateInfo* createInfo) override {
@@ -562,17 +633,36 @@ namespace openxr_api_layer {
 
             Log(fmt::format("QPC frequency: {} Hz\n", QpcFreqHz()));
             Log(fmt::format(
-                "Writing frames to: {}\n",
+                "Once started, frames will be written to: {}\n",
                 (localAppData / fmt::format("frames-{}-{}.csv",
                                             GetCurrentProcessId(), kSideStr))
                     .string()));
+            Log("Press Ctrl+F9 in the host app to start / stop monitoring\n");
 
-            g_csv.Start();
+            // Writer is NOT started here. The first Ctrl+F9 toggles
+            // monitoring on, which spins up the writer thread and
+            // truncates the per-side CSV. See ToggleMonitoring().
             return result;
         }
 
         XrResult xrEndFrame(XrSession session,
                             const XrFrameEndInfo* frameEndInfo) override {
+            // Poll the toggle BEFORE the bracket so a Ctrl+F9 press starts
+            // recording this frame (and a release stops it before this
+            // frame's bracket is opened). GetAsyncKeyState is ~100 ns; we
+            // are not inside the bracket yet so even that small cost is
+            // not attributed to the target layer.
+            if (PollHotkeyEdge()) {
+                ToggleMonitoring();
+            }
+
+            // Pass-through when monitoring is off -- zero overhead beyond
+            // the poll above. The host never knows the layer is even there
+            // until the user presses Ctrl+F9.
+            if (!g_monitoring.load(std::memory_order_acquire)) {
+                return OpenXrApi::xrEndFrame(session, frameEndInfo);
+            }
+
             // The sandwich bracket. Keep this region free of work --
             // no Log(), no string formatting, no allocations -- so the only
             // cost the bracket sees is the OpenXrApi::xrEndFrame dispatch
