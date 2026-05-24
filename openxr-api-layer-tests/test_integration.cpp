@@ -44,6 +44,13 @@
 //
 // =============================================================================
 
+// pch.h must come first: the layer's framework/dispatch.gen.h uses
+// std::vector / std::string / std::pair without including their
+// headers (it relies on the layer project's precompiled header). The
+// test project disables PCH (<PrecompiledHeader>NotUsing</PrecompiledHeader>)
+// so we pull pch.h in explicitly here, same as test_stubs.cpp.
+#include "pch.h"
+
 #include <doctest/doctest.h>
 
 #include "layer.h"
