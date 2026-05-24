@@ -4,7 +4,11 @@ emit one row per frame with the target layer's CPU cost both in microseconds
 and as a percentage of the host's per-frame wall-clock budget.
 
 Usage:
-    python analyze.py <pre.csv> <post.csv> [--out frames-merged.csv]
+    python analyze.py <pre.csv> <post.csv> [--out OUT]
+
+By default --out is `frames-merged-<pid>.csv` next to the inputs (the PID
+is extracted from the `frames-<pid>-pre.csv` naming convention), matching
+the path the in-DLL auto-merge writes to.
 
 Math:
     pre_us            = (pre_exit  - pre_entry)  / qpc_freq * 1e6

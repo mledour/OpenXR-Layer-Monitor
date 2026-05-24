@@ -311,6 +311,14 @@ namespace openxr_api_layer {
             // (or the OS recycling our PID for an unrelated process) would
             // leave a frames-merged-<pid>.csv on disk with stale numbers in
             // its header. Wipe it on every skip path so head -7 never lies.
+            //
+            // Tradeoff: a short test run that records zero frames AFTER an
+            // earlier real session with the same PID will also wipe the
+            // earlier merged file. We accept this -- a stale header with
+            // authoritative-looking stats is more dangerous than losing a
+            // recently-superseded file, and the per-side CSVs are also
+            // truncated at the new session's xrCreateInstance so the data
+            // is gone either way.
             const auto removeStale = [&] {
                 std::error_code ec;
                 std::filesystem::remove(outCsv, ec);
@@ -480,7 +488,7 @@ namespace openxr_api_layer {
                    "target_pct_of_frame\n";
             for (const auto& m : merged) {
                 out << m.frame_idx << ',' << m.thread_id << ',';
-                if (m.frame_interval_us) {
+                if (m.frame_interval_us.has_value()) {
                     out << fmt::format("{:.3f}", *m.frame_interval_us);
                 }
                 out << ',' << fmt::format("{:.3f}", m.pre_us) << ','
