@@ -563,14 +563,15 @@ namespace openxr_api_layer {
 
                 // Poll loop. The 10 ms timeout caps the worst-case
                 // "row pushed but not yet flushed" window; on Windows
-                // without an active timeBeginPeriod, sleep_for's
-                // minimum resolution is ~15 ms, so the steady-state
-                // poll cadence is "10 ms requested, ~15 ms observed".
-                // Stop() flips m_running AND notifies m_wake_cv, so
-                // the wait_for predicate fires immediately on stop --
-                // the previous sleep_for-only design paid the full
-                // ~15 ms tick on every toggle-OFF, which stacked with
-                // the merge stall directly on the frame thread.
+                // without an active timeBeginPeriod, wait_for's
+                // underlying scheduler granularity is ~15 ms, so the
+                // steady-state poll cadence is "10 ms requested,
+                // ~15 ms observed". Stop() flips m_running AND notifies
+                // m_wake_cv, so the wait_for predicate fires
+                // immediately on stop -- the previous sleep_for-only
+                // design (no notify) paid the full ~15 ms tick on
+                // every toggle-OFF, which stacked with the merge stall
+                // directly on the frame thread.
                 FrameRow row{};
                 while (true) {
                     bool drained_any = false;
