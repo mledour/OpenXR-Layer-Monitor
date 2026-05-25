@@ -230,35 +230,33 @@ namespace openxr_api_layer {
 
         std::atomic<bool> g_lastComboDown{false};
 
-        // Only the foreground host app should be able to drive the toggle.
-        // Without this, a background browser or chat app firing Ctrl+F9
-        // (common screenshot binding) would start/stop the layer's
-        // recording without the user even being inside the VR app.
-        bool IsHostInForeground() {
-            const HWND hwnd = GetForegroundWindow();
-            if (!hwnd) {
-                return false;
-            }
-            DWORD pid = 0;
-            GetWindowThreadProcessId(hwnd, &pid);
-            return pid == GetCurrentProcessId();
-        }
-
-        // ConsumeHotkeyEdge (renamed from PollHotkeyEdge) reflects the fact
-        // that exchange() mutates g_lastComboDown, so calling it twice in
-        // a row collapses the second call to "no edge". The semantic is
-        // "ask once per frame, get the rising edge if any".
+        // ConsumeHotkeyEdge reflects the fact that exchange() mutates
+        // g_lastComboDown, so calling it twice in a row collapses the
+        // second call to "no edge". The semantic is "ask once per frame,
+        // get the rising edge if any".
         //
-        // g_lastComboDown is always advanced even when the host is not in
-        // the foreground, so the user holding Ctrl+F9 in a background app
-        // and switching to the game does not get treated as a fresh edge.
+        // PREVIOUSLY this was also gated by a GetForegroundWindow() ==
+        // GetCurrentProcessId() check, to protect against a background
+        // app (Discord, browser) firing a Ctrl+F9 binding by accident.
+        // The check broke the common VR case: under runtimes that put
+        // their own compositor / device-direct window in the foreground
+        // (Pimax OpenXR, SteamVR direct mode, headless OpenXR samples
+        // like hello_xr), the host process never owns the foreground
+        // window while the HMD is mounted -- so every Ctrl+F9 was
+        // silently dropped and the layer became impossible to drive.
+        //
+        // Tradeoff accepted: Ctrl+F9 is system-wide now. A foreground
+        // Discord screenshot binding (or any other Ctrl+F9 elsewhere)
+        // will toggle the layer's recording. Recovery is cheap (press
+        // Ctrl+F9 again), and `DISABLE_XR_APILAYER_MLEDOUR_layer_monitor_pre=1`
+        // / `..._post=1` remain the standard escape hatches if a host
+        // app collides with the binding permanently.
         bool ConsumeHotkeyEdge() {
             const bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             const bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
             const bool down = ctrl && f9;
             const bool prev = g_lastComboDown.exchange(down);
-            const bool risingEdge = down && !prev;
-            return risingEdge && IsHostInForeground();
+            return down && !prev;
         }
 
         // ---- Background CSV writer -----------------------------------------
@@ -732,8 +730,7 @@ namespace openxr_api_layer {
                 (localAppData / fmt::format("frames-{}-{}.csv",
                                             GetCurrentProcessId(), kSideStr))
                     .string()));
-            Log("Press Ctrl+F9 in the foreground host app to start / stop "
-                "monitoring\n");
+            Log("Press Ctrl+F9 (system-wide hotkey) to start / stop monitoring\n");
 
             // Reset the hotkey edge-detection state on each fresh instance.
             // Some loaders create a probe instance then destroy it before
@@ -758,10 +755,9 @@ namespace openxr_api_layer {
                             const XrFrameEndInfo* frameEndInfo) override {
             // Toggle decision happens OUTSIDE the QPC bracket. Total
             // overhead in the no-monitoring case: two GetAsyncKeyState
-            // calls, one atomic exchange, a possible GetForegroundWindow
-            // (~few hundred ns) for pre, or a single atomic load for post.
-            // Approximately 200 ns total -- documented as such in the
-            // README, not "zero".
+            // calls + one atomic exchange for pre, or a single atomic
+            // load on shared memory for post. Approximately 100 ns total
+            // -- documented as such in the README, not "zero".
             if constexpr (kIsPreSide) {
                 // Pre is the authoritative poller. ApplyToggle handles the
                 // broadcast to shared memory internally, ONLY on success,

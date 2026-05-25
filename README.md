@@ -124,15 +124,24 @@ or remove the two HKLM values manually.
    but stay **idle** until you press the hotkey. While idle, each
    xrEndFrame pays for two `GetAsyncKeyState` polls plus one atomic
    exchange on the pre side, or a single atomic load on the post side
-   -- around 200 ns per side, well below the QPC noise floor.
-2. With the host app window **focused**, press **Ctrl+F9** to start
-   monitoring. The pre DLL detects the keypress and broadcasts the
-   new state to the post DLL through a small shared-memory segment;
-   both halves enter recording on the same xrEndFrame call. You will
-   see a "Monitoring STARTED" line in each side's `.log`. The hotkey
-   is ignored if any other window is foreground (Discord, browser,
-   IDE), so screenshot bindings on Ctrl+F9 in other apps do not
-   trigger the layer.
+   -- around 100 ns per side, well below the QPC noise floor.
+2. Press **Ctrl+F9** (system-wide hotkey) to start monitoring. The pre
+   DLL detects the keypress and broadcasts the new state to the post
+   DLL through a small shared-memory segment; both halves enter
+   recording on the same xrEndFrame call. You will see a
+   "Monitoring STARTED" line in each side's `.log`.
+
+   The hotkey is **system-wide**, not gated by the host being the
+   foreground window. This is intentional: under many OpenXR runtimes
+   (Pimax OpenXR, SteamVR direct mode, headless samples like
+   hello_xr) the host process never owns the foreground window while
+   the HMD is mounted -- a foreground-only check made the layer
+   impossible to drive on those hosts. Side effect: a Ctrl+F9 binding
+   in another app (Discord screenshot, screen recorder) will also
+   toggle the recording. Press Ctrl+F9 again to undo, or set
+   `DISABLE_XR_APILAYER_MLEDOUR_layer_monitor_pre=1` /
+   `..._post=1` to bypass the layer entirely if a permanent conflict
+   appears.
 3. Let the app run for **at least 30 seconds** of representative
    gameplay -- you want a steady-state sample, not the loading screen.
 4. Press **Ctrl+F9 again** to stop. The post DLL immediately drains both
@@ -395,12 +404,17 @@ the target layer's score.
   the merge on a background thread was rejected because the host
   often exits within milliseconds of the stop and the file would be
   lost.
-- **Hotkey conflict inside the host.** The hotkey is Ctrl+F9, polled
-  via `GetAsyncKeyState` from inside xrEndFrame. The poll is gated
-  by a `GetForegroundWindow` check so Ctrl+F9 in Discord, browser,
-  IDE, or any other app does NOT toggle the layer. But if the host
-  app itself binds Ctrl+F9 to something, both will fire. Rebinding
-  requires a code change today.
+- **Ctrl+F9 is a system-wide hotkey.** Polled via `GetAsyncKeyState`
+  from inside xrEndFrame; no foreground-window gating (that gating
+  used to exist but broke every runtime where the compositor /
+  device-direct window holds the foreground -- Pimax OpenXR, SteamVR
+  direct mode, hello_xr). Side effect: a Ctrl+F9 binding in another
+  app (Discord screenshot, screen recorder, IDE) will also toggle
+  the recording. Recovery is cheap (press again); the standard
+  `DISABLE_XR_APILAYER_MLEDOUR_layer_monitor_pre=1` /
+  `..._post=1` env vars remain the escape hatch for permanent
+  conflicts. Rebinding the hotkey itself requires a code change
+  today.
 - **64-bit only in the released CI artifacts.** A 32-bit target exists
   in the .vcxproj but is not currently tested.
 
