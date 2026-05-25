@@ -437,15 +437,22 @@ the target layer's score.
     process if a permanent conflict appears.
 
   Residual surface: an unrelated Ctrl+F9 in another app (Discord
-  screenshot, screen recorder, IDE shortcut) will still toggle the
-  recording. Recovery is one keypress, **but** an accidental toggle
-  cycle on a process with a previous successful session WILL truncate
-  the per-side CSVs (`std::ios::trunc` on writer start) and the
-  cancel-toggle will overwrite the merged CSV with the few frames
-  captured between the two presses. Until lazy file-open lands (see
-  follow-up), **move important `frames-*-<pid>-*.csv` and
-  `frames-merged-<pid>.csv` out of `%LOCALAPPDATA%` before the host
-  process idles in the background.**
+  screenshot, screen recorder, IDE shortcut) will still fire the
+  toggle. Two-tier protection:
+
+  - A parasitic toggle ON-then-OFF that records **zero frames** (the
+    user catches it within ~one xrEndFrame) is **safe**. The writer
+    thread opens its CSV lazily on first row, and `MergeIntoOutput`
+    bails on `g_frameCounter == 0`. Both the previous session's
+    per-side CSVs and the previous `frames-merged-<pid>.csv` survive.
+  - A parasitic toggle that records **N ≥ 1 frames** before the user
+    cancels DOES overwrite the previous session's per-side CSVs (on
+    the first `Append`) and replaces the previous merged CSV (on
+    the cancel-toggle). To recover any earlier session, **move
+    important `frames-*-<pid>-*.csv` and `frames-merged-<pid>.csv`
+    out of `%LOCALAPPDATA%` before leaving the host process running
+    in the background.** Per-session filenames (timestamps) are
+    a planned follow-up that would eliminate this case entirely.
 - **Multi-process Ctrl+F9 bleed.** Each running OpenXR process polls
   Ctrl+F9 independently. A single press toggles every active host
   that has the layer loaded. If you run a second OpenXR process for

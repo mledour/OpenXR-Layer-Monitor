@@ -120,19 +120,16 @@ namespace openxr_api_layer {
         //
         // g_frameCounter resets to 0 on each Ctrl+F9 toggle ON so every
         // recording session starts at frame 0 (matches analyze.py's view).
+        // Also doubles as the "did this session record anything" signal
+        // that MergeIntoOutput's zero-frame guard checks before touching
+        // the merged CSV on disk.
         //
         // g_skipNext drops the FIRST frame after a toggle ON: that frame's
         // pre.bracket subsumes post's std::thread() spawn (~50-500 us under
         // Windows) which would otherwise contaminate target_us on frame 0
         // of every session.
-        //
-        // g_writerEverStarted gates the "remove stale frames-merged" path
-        // in MergeIntoOutput: if this process never tried to record, we
-        // leave any pre-existing merged CSV alone -- it might belong to an
-        // earlier process Windows recycled our PID from.
         std::atomic<uint64_t> g_frameCounter{0};
         std::atomic<uint32_t> g_skipNext{0};
-        std::atomic<bool> g_writerEverStarted{false};
         std::atomic<bool> g_monitoring{false};
 
         // ---- Cross-DLL toggle sync ----------------------------------------
@@ -395,16 +392,39 @@ namespace openxr_api_layer {
                     localAppData / fmt::format("frames-{}-{}.csv",
                                                GetCurrentProcessId(), kSideStr);
 
-                std::ofstream stream(path, std::ios::out | std::ios::trunc);
-                if (!stream) {
-                    ErrorLog(fmt::format("Failed to open {}\n", path.string()));
-                    return;
-                }
-                stream << "# qpc_freq=" << QpcFreqHz() << "\n"
-                       << "# side=" << kSideStr << "\n"
-                       << "# layer=" << LayerName << "\n"
-                       << "# fn=xrEndFrame\n"
-                       << "frame_idx,thread_id,qpc_entry,qpc_exit\n";
+                // LAZY OPEN: defer truncation + header write until the
+                // FIRST batch with actual rows arrives. A parasitic toggle
+                // ON-then-OFF (Discord screenshot binding fires while the
+                // user is doing something else, then they hit Ctrl+F9 to
+                // cancel before any xrEndFrame Appends) used to wipe the
+                // previous session's CSV at writer-start time -- the file
+                // was opened with std::ios::trunc and the header written
+                // immediately, even when no rows were ever pushed. By
+                // delaying the open call, a zero-row session leaves the
+                // previous session's CSV intact on disk.
+                std::ofstream stream;
+                bool open_failed = false;
+                const auto ensureOpen = [&]() -> bool {
+                    if (stream.is_open()) {
+                        return true;
+                    }
+                    if (open_failed) {
+                        return false;
+                    }
+                    stream.open(path, std::ios::out | std::ios::trunc);
+                    if (!stream) {
+                        ErrorLog(fmt::format("Failed to open {}\n",
+                                             path.string()));
+                        open_failed = true;
+                        return false;
+                    }
+                    stream << "# qpc_freq=" << QpcFreqHz() << "\n"
+                           << "# side=" << kSideStr << "\n"
+                           << "# layer=" << LayerName << "\n"
+                           << "# fn=xrEndFrame\n"
+                           << "frame_idx,thread_id,qpc_entry,qpc_exit\n";
+                    return true;
+                };
 
                 std::vector<FrameRow> batch;
                 while (true) {
@@ -416,23 +436,27 @@ namespace openxr_api_layer {
                         batch.swap(m_queue);
                     }
 
-                    for (const auto& r : batch) {
-                        stream << r.frame_idx << ',' << r.thread_id << ','
-                               << r.qpc_entry << ',' << r.qpc_exit << '\n';
+                    if (!batch.empty() && ensureOpen()) {
+                        for (const auto& r : batch) {
+                            stream << r.frame_idx << ',' << r.thread_id << ','
+                                   << r.qpc_entry << ',' << r.qpc_exit << '\n';
+                        }
+                        stream.flush();
                     }
                     batch.clear();
-                    stream.flush();
 
                     if (!m_running.load(std::memory_order_acquire)) {
                         // Drain the trailing rows that may have arrived
                         // between our last swap and the running=false flip.
                         std::lock_guard<std::mutex> lock(m_mutex);
-                        for (const auto& r : m_queue) {
-                            stream << r.frame_idx << ',' << r.thread_id << ','
-                                   << r.qpc_entry << ',' << r.qpc_exit << '\n';
+                        if (!m_queue.empty() && ensureOpen()) {
+                            for (const auto& r : m_queue) {
+                                stream << r.frame_idx << ',' << r.thread_id << ','
+                                       << r.qpc_entry << ',' << r.qpc_exit << '\n';
+                            }
+                            stream.flush();
                         }
                         m_queue.clear();
-                        stream.flush();
                         return;
                     }
                 }
@@ -456,10 +480,10 @@ namespace openxr_api_layer {
         //
         // Thin wrapper around utils/merge.cpp's pure functions. This is the
         // OS-facing glue: resolves the three paths under localAppData,
-        // applies the removeStale policy (gated on g_writerEverStarted so
-        // we never wipe a recycled-PID file from an earlier process), and
-        // opens the ofstream in binary mode so the LF '\n' characters
-        // emitted by WriteMergedCsv survive MSVC's text-mode translation.
+        // applies the data-preservation policies (zero-frame guard +
+        // removeStale on the no-matching-rows path), and opens the
+        // ofstream in binary mode so the LF '\n' characters emitted by
+        // WriteMergedCsv survive MSVC's text-mode translation.
         //
         // All actual parsing, joining, stats, and formatting lives in
         // utils/merge.cpp where it can be unit-tested independently.
@@ -478,13 +502,31 @@ namespace openxr_api_layer {
             const fs::path outCsv =
                 localAppData / fmt::format("frames-merged-{}.csv", pid);
 
-            // Gated on g_writerEverStarted so a process that never recorded
-            // does not delete a perfectly valid merged CSV inherited from a
-            // previous process at the same PID.
+            // ZERO-FRAME GUARD: a parasitic toggle (accidental Ctrl+F9
+            // from another app fires the rising edge, user cancels with
+            // a second Ctrl+F9 before any xrEndFrame Append) MUST NOT
+            // remove the previous session's frames-merged-<pid>.csv
+            // from disk. With the FrameCsvSink lazy-open change, the
+            // per-side CSVs are also untouched in this case -- we mirror
+            // that by skipping the merge entirely here. g_frameCounter
+            // is reset to 0 on every ApplyToggle(true) and incremented
+            // only on real recorded frames, so g_frameCounter == 0 at
+            // toggle-OFF time means "this session never wrote a row".
+            if (g_frameCounter.load(std::memory_order_acquire) == 0) {
+                Log("Skipping merge: this session recorded zero frames "
+                    "(parasitic toggle, or xrDestroyInstance fired before "
+                    "any xrEndFrame). Previous frames-merged-<pid>.csv "
+                    "(if any) preserved on disk.\n");
+                return;
+            }
+
+            // removeStale is now safe to call unconditionally on the
+            // no-rows / no-matches / open-fail paths: passing the zero-
+            // frame guard above proves THIS session has data of its own
+            // about to be written, so any pre-existing merged file at
+            // this PID is from an earlier session of THIS process (which
+            // the current session has just superseded).
             const auto removeStale = [&] {
-                if (!g_writerEverStarted.load(std::memory_order_acquire)) {
-                    return;
-                }
                 std::error_code ec;
                 std::filesystem::remove(outCsv, ec);
             };
@@ -590,13 +632,16 @@ namespace openxr_api_layer {
         // - Local state is committed FIRST. If g_csv.Start() throws (e.g.
         //   std::system_error from std::thread resource exhaustion, or a
         //   std::runtime_error from the FrameCsvSink wedged state), we
-        //   bail out before touching shared memory. This guarantees:
-        //     * post never sees a "broadcast was on but pre actually
-        //       failed" state (finding N1),
-        //     * g_writerEverStarted only flips on a real Start success,
-        //       so a recycled-PID frames-merged-<pid>.csv from an earlier
-        //       process is not nuked by a Start that never produced data
-        //       (finding N2 / N4).
+        //   bail out before touching shared memory. This guarantees post
+        //   never sees a "broadcast was on but pre actually failed" state.
+        //
+        //   Data-loss protection lives elsewhere now (was previously the
+        //   g_writerEverStarted gate): MergeIntoOutput's zero-frame guard
+        //   refuses to write or remove the merged CSV when this session
+        //   recorded nothing, and FrameCsvSink::Run() defers opening the
+        //   per-side CSV until the first non-empty batch arrives, so a
+        //   Start() that throws (or a session that ends with no Append)
+        //   leaves the previous session's files on disk untouched.
         // - Post calls ApplyToggle from its observe path; the constexpr
         //   guard on the broadcast prevents it from re-broadcasting and
         //   creating a generation feedback loop with pre.
@@ -635,7 +680,6 @@ namespace openxr_api_layer {
                     ErrorLog("Writer start failed: unknown exception\n");
                     return;
                 }
-                g_writerEverStarted.store(true, std::memory_order_release);
             } else {
                 g_csv.Stop();  // noexcept; catches its own join exceptions
                 if constexpr (kIsPostSide) {
