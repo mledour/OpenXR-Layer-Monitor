@@ -124,18 +124,13 @@ namespace openxr_api_layer::merge {
         return result;
     }
 
+    // preFreq is authoritative for both sides; postFreq is intentionally
+    // ignored (matches analyze.py's pre.qpc_freq) -- kept in the signature
+    // so callers continue to ferry per-side metadata through, and so a
+    // future cross-machine bridging feature has a place to land.
     std::vector<MergedRow> ComputeMerge(
         const std::vector<RawFrameRow>& preRows, int64_t preFreq,
-        const std::vector<RawFrameRow>& /*postFreq is intentionally ignored
-                                          here -- preFreq is authoritative
-                                          for both sides, matching the
-                                          Python analyzer. The parameter
-                                          is preserved in the signature so
-                                          callers continue to ferry the
-                                          per-side metadata through and so
-                                          a future cross-machine bridging
-                                          feature has a place to land.*/
-        postRows, int64_t /*postFreq*/) {
+        const std::vector<RawFrameRow>& postRows, int64_t /*postFreq*/) {
         using Key = std::pair<uint64_t, uint32_t>;
         const auto mk = [](uint64_t fi, uint32_t tid) -> Key { return {fi, tid}; };
 
