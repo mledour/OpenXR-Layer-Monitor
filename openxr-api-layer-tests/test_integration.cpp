@@ -40,7 +40,10 @@
 //     between the last CHECK and the next TEST_CASE. Likely the same root
 //     cause (framework destructor + singleton lifecycle + the mock's
 //     resolved procs). Dropped pending a debugger session on Windows.
-//   * Hotkey path (GetAsyncKeyState / GetForegroundWindow / shared memory).
+//   * Hotkey path (GetAsyncKeyState + AltGr mask + debounce + shared
+//     memory broadcast / observe). Would benefit from a stub that
+//     injects synthesised key states into SampleHotkeyDown so a test
+//     can drive ConsumeHotkeyEdge without depending on real keyboard.
 //
 // The OpenXrLayer instance created by this test is intentionally NOT
 // destroyed: process-exit static destructors will clean it up. Without
