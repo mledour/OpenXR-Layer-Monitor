@@ -317,16 +317,38 @@ namespace openxr_api_layer {
         // single consumer (writer thread). N must be a power of two so
         // the index wrap is a cheap bitmask instead of a modulo divide.
         //
-        // Size: 4096 * sizeof(FrameRow) = 128 KiB per FrameCsvSink. With
-        // one row per host xrEndFrame at 90 Hz, the ring buffers ~45 s
-        // of records -- more than enough to absorb any disk hiccup. If
-        // it ever does overflow, push() returns false and the caller
-        // increments a dropped counter; the row is dropped, the frame
-        // thread does NOT block.
+        // SINGLE-PRODUCER CONTRACT: Push() does a plain `load + store`
+        // pair on m_head, NOT a CAS. Concurrent producers would race on
+        // the same slot and tear the FrameRow write. The contract is
+        // satisfied today because the OpenXR spec requires per-session
+        // xrEndFrame serialization, and the layer holds one OpenXrLayer
+        // (one g_csv) per XrInstance. A future multi-session host that
+        // calls xrEndFrame concurrently from two sessions of the same
+        // XrInstance would break this -- the fix would be either to
+        // intercept xrCreateSession and refuse the second one, or to
+        // upgrade Push to a CAS-based MPSC variant. Today's overlay /
+        // compositor uses a SEPARATE XrInstance so the contract holds.
+        //
+        // Size: 4096 * sizeof(Slot) = 256 KiB per FrameCsvSink. With one
+        // row per host xrEndFrame at 90 Hz, the ring buffers ~45 s of
+        // records -- more than enough to absorb any disk hiccup. If it
+        // ever does overflow, Push returns false and the caller bumps a
+        // dropped counter; the row is dropped, the frame thread does
+        // NOT block.
         template <typename T, size_t N>
         class SpscRingBuffer {
             static_assert((N & (N - 1)) == 0, "N must be a power of two");
             static constexpr size_t kMask = N - 1;
+
+            // Each slot lives on its own cache line. alignas on the
+            // array base alone (the original layout) only aligned the
+            // first slot -- adjacent FrameRow entries (32 bytes each)
+            // would still share a 64-byte line, recreating the
+            // producer/consumer false-sharing that we tried to avoid
+            // with the head/tail padding below.
+            struct alignas(64) Slot {
+                T value;
+            };
 
           public:
             // Producer: returns false if full. ~15-20 ns on x86 (relaxed
@@ -337,7 +359,7 @@ namespace openxr_api_layer {
                 if (next == m_tail.load(std::memory_order_acquire)) {
                     return false;
                 }
-                m_buffer[head] = item;
+                m_buffer[head].value = item;
                 m_head.store(next, std::memory_order_release);
                 return true;
             }
@@ -348,7 +370,7 @@ namespace openxr_api_layer {
                 if (tail == m_head.load(std::memory_order_acquire)) {
                     return false;
                 }
-                out = m_buffer[tail];
+                out = m_buffer[tail].value;
                 m_tail.store((tail + 1) & kMask, std::memory_order_release);
                 return true;
             }
@@ -365,11 +387,23 @@ namespace openxr_api_layer {
             // cache line on every push.
             alignas(64) std::atomic<size_t> m_head{0};
             alignas(64) std::atomic<size_t> m_tail{0};
-            alignas(64) T m_buffer[N]{};
+            alignas(64) Slot m_buffer[N]{};
         };
 
         class FrameCsvSink {
           public:
+            // The g_csv instance lives at namespace scope and is destroyed
+            // during DLL unload. If the host terminated via TerminateProcess
+            // / Alt+F4 / anti-cheat kill / a crash mid-recording,
+            // xrDestroyInstance was never called, OpenXrLayer's destructor
+            // never ran, and the writer thread is still joinable. Without
+            // this destructor, ~std::thread on a joinable thread invokes
+            // std::terminate during teardown -- the layer would crash the
+            // host's exit path. Stop() is idempotent so a clean shutdown
+            // path (where ApplyToggle(false) already stopped the writer)
+            // passes through here harmlessly.
+            ~FrameCsvSink() { Stop(); }
+
             // Throws std::system_error if std::thread construction fails
             // (e.g., thread resource exhaustion), or std::runtime_error if
             // we are wedged from a previous failed Stop() join. Callers
@@ -386,11 +420,17 @@ namespace openxr_api_layer {
                         "FrameCsvSink wedged after a prior detach; "
                         "restart the host process to recover");
                 }
+                // Reset BEFORE the CAS so an Start() that hits the
+                // running=true early-return still observes a fresh
+                // counter on the next Stop()->footer cycle. Symmetry
+                // with Stop()'s reset at the end ensures the counter
+                // is always cleared between sessions, never leaking
+                // drops across the boundary.
+                m_droppedQueueFull.store(0, std::memory_order_relaxed);
                 bool expected = false;
                 if (!m_running.compare_exchange_strong(expected, true)) {
                     return;
                 }
-                m_droppedQueueFull.store(0, std::memory_order_relaxed);
                 try {
                     m_thread = std::thread([this] { Run(); });
                 } catch (...) {
@@ -404,11 +444,27 @@ namespace openxr_api_layer {
             // detach as a last resort, and flip m_wedged so any future
             // Start() refuses to spawn a second writer that would race
             // the orphaned one on the ring + CSV file.
+            //
+            // Latency: prior to this commit Stop() relied on a sleep_for
+            // tick to expire (~15 ms on Windows without timeBeginPeriod).
+            // Now Stop signals the writer through a cv whose ONLY purpose
+            // is the stop wakeup -- Append() does NOT touch the cv, so
+            // the frame-thread fast path stays at ~20 ns. Stop's
+            // wake-then-join completes in under a millisecond in the
+            // common case.
             void Stop() noexcept {
                 bool expected = true;
                 if (!m_running.compare_exchange_strong(expected, false)) {
                     return;
                 }
+                // The lock is held briefly only to ensure the wait_for
+                // predicate observes the m_running=false store above
+                // (the lock pairs with the unique_lock in Run()). The
+                // notify itself is mutex-free.
+                {
+                    std::lock_guard<std::mutex> lock(m_wake_mutex);
+                }
+                m_wake_cv.notify_all();
                 if (m_thread.joinable()) {
                     try {
                         m_thread.join();
@@ -428,8 +484,11 @@ namespace openxr_api_layer {
             // Frame-thread hot path. The whole xrEndFrame budget for the
             // post side's residual bias hangs on this being cheap and
             // never blocking. No mutex, no cv signal -- the writer
-            // polls. Drop counter is bumped on overflow (~45 s of
-            // continuous disk-stall at 90 Hz before the ring fills).
+            // polls (waking instantly only on Stop). Drop counter is
+            // bumped on overflow (~45 s of continuous disk-stall at
+            // 90 Hz before the ring fills).
+            //
+            // SINGLE PRODUCER ONLY (see SpscRingBuffer's contract).
             void Append(const FrameRow& row) {
                 if (!m_ring.Push(row)) {
                     m_droppedQueueFull.fetch_add(
@@ -437,8 +496,14 @@ namespace openxr_api_layer {
                 }
             }
 
+            // Acquire matches the producer's relaxed fetch_add: the
+            // synchronization that actually publishes the final counter
+            // value to the consumer happens via the m_running release
+            // store in Stop() and the m_thread.join() that pairs with
+            // the writer's exit. Stating acquire here makes the
+            // happens-before chain explicit for non-x86 readers.
             uint64_t DroppedQueueFull() const {
-                return m_droppedQueueFull.load(std::memory_order_relaxed);
+                return m_droppedQueueFull.load(std::memory_order_acquire);
             }
 
           private:
@@ -452,10 +517,19 @@ namespace openxr_api_layer {
                     localAppData / fmt::format("frames-{}-{}.csv",
                                                GetCurrentProcessId(), kSideStr);
 
-                // LAZY OPEN (defer truncation + header write until the
-                // first row arrives) -- see the comment that used to live
-                // here. A zero-row session leaves the previous session's
-                // CSV intact on disk.
+                // LAZY OPEN: defer truncation + header write until the
+                // FIRST batch with actual rows arrives. A parasitic
+                // toggle ON-then-OFF (Discord screenshot binding fires
+                // while the user is doing something else, then they hit
+                // Ctrl+F9 to cancel before any xrEndFrame Appends) used
+                // to wipe the previous session's CSV at writer-start
+                // time -- the file was opened with std::ios::trunc and
+                // the header written immediately, even when no rows
+                // were ever pushed. Combined with MergeIntoOutput's
+                // zero-frame guard, the result on disk is: a session
+                // that recorded zero rows leaves every previously
+                // existing file (per-side CSVs AND frames-merged) bit-
+                // for-bit untouched.
                 std::ofstream stream;
                 bool open_failed = false;
                 const auto ensureOpen = [&]() -> bool {
@@ -487,11 +561,16 @@ namespace openxr_api_layer {
                     }
                 };
 
-                // Poll loop. ~10 ms cadence keeps the writer CPU cost
-                // negligible while bounding the worst-case "row written
-                // but not yet on disk" window to ~10 ms + flush time.
-                // Stop() relies on m_running becoming false; the next
-                // iteration after the sleep notices and drains + returns.
+                // Poll loop. The 10 ms timeout caps the worst-case
+                // "row pushed but not yet flushed" window; on Windows
+                // without an active timeBeginPeriod, sleep_for's
+                // minimum resolution is ~15 ms, so the steady-state
+                // poll cadence is "10 ms requested, ~15 ms observed".
+                // Stop() flips m_running AND notifies m_wake_cv, so
+                // the wait_for predicate fires immediately on stop --
+                // the previous sleep_for-only design paid the full
+                // ~15 ms tick on every toggle-OFF, which stacked with
+                // the merge stall directly on the frame thread.
                 FrameRow row{};
                 while (true) {
                     bool drained_any = false;
@@ -512,9 +591,9 @@ namespace openxr_api_layer {
                         if (stream.is_open()) {
                             stream.flush();
                         }
-                        // Footer: surface drop counts so the user knows if
-                        // the ring overflowed during the session. Quiet
-                        // when zero so the common case stays clean.
+                        // Footer: surface drop counts so the user knows
+                        // if the ring overflowed during the session.
+                        // Quiet when zero so the common case stays clean.
                         const auto drops = DroppedQueueFull();
                         if (drops > 0 && ensureOpen()) {
                             stream << "# session_end dropped_queue_full="
@@ -524,8 +603,13 @@ namespace openxr_api_layer {
                         return;
                     }
 
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(10));
+                    std::unique_lock<std::mutex> lock(m_wake_mutex);
+                    m_wake_cv.wait_for(
+                        lock, std::chrono::milliseconds(10),
+                        [this] {
+                            return !m_running.load(
+                                std::memory_order_acquire);
+                        });
                 }
             }
 
@@ -537,6 +621,13 @@ namespace openxr_api_layer {
             std::atomic<bool> m_wedged{false};
             std::atomic<uint64_t> m_droppedQueueFull{0};
             std::thread m_thread;
+            // Stop-only wakeup. Append() never touches these (the frame
+            // thread stays lock-free); only Stop() ever calls notify.
+            // The writer waits on m_wake_cv with a 10 ms timeout, so
+            // new rows pushed between Stop and the previous Pop drain
+            // still hit disk on the final drain phase.
+            std::mutex m_wake_mutex;
+            std::condition_variable m_wake_cv;
             // 4096 rows (~128 KiB) absorbs ~45 s of continuous 90-Hz
             // recording even if the writer thread never gets a tick of
             // CPU. Overflow is unreachable on a healthy machine; the
