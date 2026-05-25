@@ -90,7 +90,20 @@ namespace openxr_api_layer::log {
     void Log(const char* fmt, ...) {
         va_list va;
         va_start(va, fmt);
-        InternalLog(fmt, va, /*forceFlush=*/false);
+        // forceFlush=true: VR apps and games routinely exit via
+        // TerminateProcess() which skips static destructors -- including
+        // the std::ofstream destructor that would normally flush the log
+        // buffer at process exit. Without the per-call flush, every
+        // healthy session would leave behind a zero-byte .log, defeating
+        // the layer's primary post-mortem channel. The original banner
+        // (~15 Log() calls per xrCreateInstance, "one buffered write per
+        // call and a single implicit flush at shutdown") assumed clean
+        // shutdown -- which is not the common case for OpenXR hosts.
+        //
+        // Cost: ~1-10 us per flush * ~15 init calls = ~150 us at startup,
+        // zero per frame (the file's own banner forbids Log() from any
+        // frame-thread hot path).
+        InternalLog(fmt, va, /*forceFlush=*/true);
         va_end(va);
     }
 
