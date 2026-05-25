@@ -122,9 +122,11 @@ or remove the two HKLM values manually.
 
 1. Launch your OpenXR app normally. The two layers attach automatically
    but stay **idle** until you press the hotkey. While idle, each
-   xrEndFrame pays for two `GetAsyncKeyState` polls plus one atomic
-   exchange on the pre side, or a single atomic load on the post side
-   -- around 100 ns per side, well below the QPC noise floor.
+   xrEndFrame pays for ~three `GetAsyncKeyState` polls (Ctrl, F9, RAlt
+   for the AltGr mask) plus one atomic exchange on the pre side, or
+   an acquire-load on shared memory plus a local comparison on the
+   post side. Sub-microsecond on modern x86, comfortably below the
+   QPC noise floor.
 2. Press **Ctrl+F9** (system-wide hotkey) to start monitoring. The pre
    DLL detects the keypress and broadcasts the new state to the post
    DLL through a small shared-memory segment; both halves enter
@@ -136,12 +138,26 @@ or remove the two HKLM values manually.
    (Pimax OpenXR, SteamVR direct mode, headless samples like
    hello_xr) the host process never owns the foreground window while
    the HMD is mounted -- a foreground-only check made the layer
-   impossible to drive on those hosts. Side effect: a Ctrl+F9 binding
-   in another app (Discord screenshot, screen recorder) will also
-   toggle the recording. Press Ctrl+F9 again to undo, or set
-   `DISABLE_XR_APILAYER_MLEDOUR_layer_monitor_pre=1` /
-   `..._post=1` to bypass the layer entirely if a permanent conflict
-   appears.
+   impossible to drive on those hosts.
+
+   Side effects to know:
+
+   - A Ctrl+F9 binding in another app (Discord screenshot, screen
+     recorder, IDE debugger) will also toggle the recording. Press
+     Ctrl+F9 again to undo. **AltGr+F9** is explicitly NOT a toggle
+     (AltGr's synthetic LCtrl is masked) so AZERTY / QWERTZ users can
+     keep using their debugger.
+   - Successive toggles are debounced to ~500 ms apart so a rapid-fire
+     binding (OBS / ShadowPlay instant replay) cannot start+stop the
+     recording in two consecutive frames.
+   - **Each OpenXR process polls independently.** If you have a
+     second OpenXR process running concurrently (a debug tool, a
+     parallel test app, OpenXR Tools for WMR) it will receive the
+     same Ctrl+F9 and start its own recording. Stop it manually or
+     set `DISABLE_XR_APILAYER_MLEDOUR_layer_monitor_pre=1` /
+     `..._post=1` in that process's environment to keep it out.
+   - `DISABLE_*` env vars remain the permanent-conflict escape hatch
+     if a host app's own Ctrl+F9 binding cannot be rebound.
 3. Let the app run for **at least 30 seconds** of representative
    gameplay -- you want a steady-state sample, not the loading screen.
 4. Press **Ctrl+F9 again** to stop. The post DLL immediately drains both
@@ -408,13 +424,36 @@ the target layer's score.
   from inside xrEndFrame; no foreground-window gating (that gating
   used to exist but broke every runtime where the compositor /
   device-direct window holds the foreground -- Pimax OpenXR, SteamVR
-  direct mode, hello_xr). Side effect: a Ctrl+F9 binding in another
-  app (Discord screenshot, screen recorder, IDE) will also toggle
-  the recording. Recovery is cheap (press again); the standard
+  direct mode, hello_xr). Three mitigations are in place:
+
+  - **AltGr+F9** is masked (AltGr's synthetic LCtrl is detected via
+    VK_RMENU). AZERTY / QWERTZ / Nordic users keep their debugger
+    run key without toggling the recording.
+  - **500 ms debounce** between successful toggles. A rapid-fire
+    binding (ShadowPlay / OBS instant replay sending Ctrl+F9 twice
+    in tens of ms) cannot churn the recording.
+  - **`DISABLE_XR_APILAYER_MLEDOUR_layer_monitor_pre=1` /
+    `..._post=1`** env vars bypass the layer entirely for a target
+    process if a permanent conflict appears.
+
+  Residual surface: an unrelated Ctrl+F9 in another app (Discord
+  screenshot, screen recorder, IDE shortcut) will still toggle the
+  recording. Recovery is one keypress, **but** an accidental toggle
+  cycle on a process with a previous successful session WILL truncate
+  the per-side CSVs (`std::ios::trunc` on writer start) and the
+  cancel-toggle will overwrite the merged CSV with the few frames
+  captured between the two presses. Until lazy file-open lands (see
+  follow-up), **move important `frames-*-<pid>-*.csv` and
+  `frames-merged-<pid>.csv` out of `%LOCALAPPDATA%` before the host
+  process idles in the background.**
+- **Multi-process Ctrl+F9 bleed.** Each running OpenXR process polls
+  Ctrl+F9 independently. A single press toggles every active host
+  that has the layer loaded. If you run a second OpenXR process for
+  debug (OpenXR Tools, hello_xr, a unit-test harness), set
   `DISABLE_XR_APILAYER_MLEDOUR_layer_monitor_pre=1` /
-  `..._post=1` env vars remain the escape hatch for permanent
-  conflicts. Rebinding the hotkey itself requires a code change
-  today.
+  `..._post=1` in its environment to keep it out of the global
+  toggle. Rebinding the hotkey itself (away from Ctrl+F9) requires
+  a code change today.
 - **64-bit only in the released CI artifacts.** A 32-bit target exists
   in the .vcxproj but is not currently tested.
 
