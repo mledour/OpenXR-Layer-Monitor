@@ -457,14 +457,49 @@ namespace openxr_api_layer {
                 std::filesystem::remove(outCsv, ec);
             };
 
-            const auto pre = merge::ReadFrameCsv(preCsv, QpcFreqHz());
-            const auto post = merge::ReadFrameCsv(postCsv, QpcFreqHz());
+            // Default qpc_freq matches analyze.py (10 MHz) rather than the
+            // local machine's QpcFreqHz(). In production both halves write
+            // their header so this default never applies, but cross-
+            // machine debugging (CSVs copied off the recording box) used
+            // to give a platform-dependent factor difference between the
+            // C++ merge and analyze.py. The fixed 10 MHz makes that
+            // scenario reproducible.
+            constexpr int64_t kDefaultQpcFreq = 10'000'000;
+            const auto pre = merge::ReadFrameCsv(preCsv, kDefaultQpcFreq);
+            const auto post = merge::ReadFrameCsv(postCsv, kDefaultQpcFreq);
+
+            if (!pre.header_valid) {
+                ErrorLog(fmt::format(
+                    "Pre CSV has unexpected column header at {}: did you "
+                    "point a merged-CSV here by mistake?\n",
+                    preCsv.string()));
+                removeStale();
+                return;
+            }
+            if (!post.header_valid) {
+                ErrorLog(fmt::format(
+                    "Post CSV has unexpected column header at {}: did you "
+                    "point a merged-CSV here by mistake?\n",
+                    postCsv.string()));
+                removeStale();
+                return;
+            }
             if (pre.rows.empty() || post.rows.empty()) {
                 Log(fmt::format(
                     "Skipping auto-merge: pre={} rows, post={} rows\n",
                     pre.rows.size(), post.rows.size()));
                 removeStale();
                 return;
+            }
+
+            // Mirror analyze.py: warn on freq mismatch, use pre.qpc_freq
+            // for both sides. ComputeMerge does the right thing with the
+            // single-freq invariant; this log surfaces the surprise so
+            // the user is not silently misled.
+            if (pre.qpc_freq != post.qpc_freq) {
+                Log(fmt::format(
+                    "warning: qpc_freq mismatch pre={} post={} -- using pre\n",
+                    pre.qpc_freq, post.qpc_freq));
             }
 
             const auto merged = merge::ComputeMerge(
@@ -497,6 +532,19 @@ namespace openxr_api_layer {
                 return;
             }
             merge::WriteMergedCsv(out, merged, stats);
+            out.flush();
+            // After write + flush, the ofstream sets failbit if any inserter
+            // hit a hard error (ENOSPC, sandboxed write denial, broken pipe,
+            // etc.). Surfacing the failure here turns a silently-truncated
+            // merged CSV into an obvious "Wrote ... failed" line in the log.
+            if (!out.good()) {
+                ErrorLog(fmt::format(
+                    "Merged output write failed (disk full / lost write "
+                    "access during the merge): {}\n",
+                    outCsv.string()));
+                removeStale();
+                return;
+            }
             Log(fmt::format("Wrote merged CSV: {} ({} frames)\n",
                             outCsv.string(), merged.size()));
         }

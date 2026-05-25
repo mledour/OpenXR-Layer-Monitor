@@ -174,13 +174,20 @@ def main() -> int:
         post_us = qpc_to_us(pox - poe)
         target_us = pre_us - post_us
 
+        # Both frame_interval_us and target_pct stay None when the
+        # interval is missing OR non-positive. Non-invariant TSC across
+        # a core migration can produce qpc_entry[i+1] < qpc_entry[i],
+        # in which case "frame interval" is undefined; emitting a
+        # negative number would mislead any downstream tool dividing by
+        # it. Matches the C++ ComputeMerge guard.
+        frame_interval_us = None
+        target_pct = None
         pe_next = next_entry.get((fi, tid))
         if pe_next is not None:
-            frame_interval_us = qpc_to_us(pe_next - pe)
-            target_pct = target_us / frame_interval_us * 100.0 if frame_interval_us > 0 else None
-        else:
-            frame_interval_us = None
-            target_pct = None
+            fiv = qpc_to_us(pe_next - pe)
+            if fiv > 0:
+                frame_interval_us = fiv
+                target_pct = target_us / fiv * 100.0
 
         merged.append((fi, tid, frame_interval_us, pre_us, post_us, target_us, target_pct))
 

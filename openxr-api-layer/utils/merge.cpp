@@ -25,19 +25,58 @@
 #include "merge.h"
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <string>
+#include <string_view>
 
 #include <fmt/format.h>
 
 namespace openxr_api_layer::merge {
 
+    namespace {
+
+        // Trim trailing CR/space/tab so a CRLF-terminated header line still
+        // compares equal to kExpectedColumnHeader. We deliberately do NOT
+        // touch leading whitespace -- the spec'd column header has none.
+        std::string_view RTrim(std::string_view s) {
+            while (!s.empty() &&
+                   (s.back() == ' ' || s.back() == '\r' || s.back() == '\t')) {
+                s.remove_suffix(1);
+            }
+            return s;
+        }
+
+        // Strict integer parse: succeeds only if the ENTIRE string is one
+        // base-10 integer (after RTrim). std::stoll would silently accept
+        // "1e7" -> 1 and "10000000 Hz" -> 10000000, both of which Python's
+        // int() rejects. Aligning the two paths.
+        std::optional<int64_t> StrictStoll(std::string_view s) {
+            s = RTrim(s);
+            // Reject leading whitespace too; Python's int() does the same.
+            if (s.empty() || s.front() == ' ' || s.front() == '\t') {
+                return std::nullopt;
+            }
+            int64_t out = 0;
+            const auto* begin = s.data();
+            const auto* end = s.data() + s.size();
+            const auto [ptr, ec] = std::from_chars(begin, end, out);
+            if (ec != std::errc{} || ptr != end) {
+                return std::nullopt;
+            }
+            return out;
+        }
+
+    } // namespace
+
     ParsedFrameCsv ReadFrameCsv(const std::filesystem::path& path,
                                 int64_t defaultFreq) {
         ParsedFrameCsv result;
         result.qpc_freq = defaultFreq;
+        result.header_valid = true;  // optimistic; flipped below if violated
         std::ifstream s(path);
         if (!s) {
             return result;
@@ -51,15 +90,26 @@ namespace openxr_api_layer::merge {
             if (line[0] == '#') {
                 static const std::string kFreqKey = "qpc_freq=";
                 if (const auto p = line.find(kFreqKey); p != std::string::npos) {
-                    try {
-                        result.qpc_freq = std::stoll(line.substr(p + kFreqKey.size()));
-                    } catch (...) {
-                        // keep defaultFreq
+                    if (const auto parsed = StrictStoll(
+                            std::string_view(line).substr(p + kFreqKey.size()))) {
+                        result.qpc_freq = *parsed;
                     }
+                    // else: keep defaultFreq -- garbage qpc_freq value (e.g.
+                    // "1e7", "10 MHz", or trailing junk) does not silently
+                    // become a wrong base-10 truncation.
                 }
                 continue;
             }
             if (!header_consumed) {
+                // The first non-comment, non-empty line MUST be the spec'd
+                // column header. Anything else (most likely: a merged CSV
+                // fed in by mistake, whose first non-comment line lists
+                // seven different columns) is rejected so the caller can
+                // emit a clear error instead of "skipping merge: 0 rows".
+                if (RTrim(line) != kExpectedColumnHeader) {
+                    result.header_valid = false;
+                    return result;
+                }
                 header_consumed = true;
                 continue;
             }
@@ -76,11 +126,22 @@ namespace openxr_api_layer::merge {
 
     std::vector<MergedRow> ComputeMerge(
         const std::vector<RawFrameRow>& preRows, int64_t preFreq,
-        const std::vector<RawFrameRow>& postRows, int64_t postFreq) {
-        // Index post by (frame_idx, thread_id) for O(log n) lookup.
+        const std::vector<RawFrameRow>& /*postFreq is intentionally ignored
+                                          here -- preFreq is authoritative
+                                          for both sides, matching the
+                                          Python analyzer. The parameter
+                                          is preserved in the signature so
+                                          callers continue to ferry the
+                                          per-side metadata through and so
+                                          a future cross-machine bridging
+                                          feature has a place to land.*/
+        postRows, int64_t /*postFreq*/) {
         using Key = std::pair<uint64_t, uint32_t>;
         const auto mk = [](uint64_t fi, uint32_t tid) -> Key { return {fi, tid}; };
 
+        // Index post by (frame_idx, thread_id). We will erase entries as
+        // they are matched so a duplicate pre key cannot re-match the same
+        // post entry twice -- matches analyze.py's post_index.pop().
         std::map<Key, RawFrameRow> postIndex;
         for (const auto& r : postRows) {
             postIndex[mk(r.frame_idx, r.thread_id)] = r;
@@ -101,6 +162,7 @@ namespace openxr_api_layer::merge {
             }
         }
 
+        const int64_t freq = preFreq;  // authoritative for both sides
         std::vector<MergedRow> merged;
         merged.reserve(preRows.size());
         for (const auto& pre : preRows) {
@@ -108,28 +170,36 @@ namespace openxr_api_layer::merge {
             if (it == postIndex.end()) {
                 continue;
             }
-            const auto& post = it->second;
+            const RawFrameRow post = it->second;
+            postIndex.erase(it);  // consume on match -- prevents double-counting
+
             MergedRow m{};
             m.frame_idx = pre.frame_idx;
             m.thread_id = pre.thread_id;
             m.pre_us =
-                static_cast<double>(pre.qpc_exit - pre.qpc_entry) / preFreq * 1e6;
+                static_cast<double>(pre.qpc_exit - pre.qpc_entry) / freq * 1e6;
             m.post_us =
-                static_cast<double>(post.qpc_exit - post.qpc_entry) / postFreq * 1e6;
+                static_cast<double>(post.qpc_exit - post.qpc_entry) / freq * 1e6;
             m.target_us = m.pre_us - m.post_us;
             if (const auto ne = nextEntry.find(mk(pre.frame_idx, pre.thread_id));
                 ne != nextEntry.end()) {
                 const double fiv =
-                    static_cast<double>(ne->second - pre.qpc_entry) / preFreq * 1e6;
-                m.frame_interval_us = fiv;
+                    static_cast<double>(ne->second - pre.qpc_entry) / freq * 1e6;
+                // Only populate the interval / pct fields when fiv is a
+                // sane positive duration. A non-invariant TSC across a
+                // core migration can produce qpc_entry[i+1] < qpc_entry[i];
+                // emitting that as a negative "interval" downstream would
+                // mislead any tool that divides by it.
                 if (fiv > 0.0) {
+                    m.frame_interval_us = fiv;
                     m.target_pct_of_frame = m.target_us / fiv * 100.0;
                 }
             }
             merged.push_back(m);
         }
         // stable_sort: defends against duplicate (thread, frame_idx) keys
-        // sneaking through if some future change drops the dedup in postIndex.
+        // sneaking through if a future refactor weakens the consume-on-match
+        // contract above.
         std::stable_sort(merged.begin(), merged.end(),
                          [](const MergedRow& a, const MergedRow& b) {
                              if (a.thread_id != b.thread_id) {
@@ -139,6 +209,32 @@ namespace openxr_api_layer::merge {
                          });
         return merged;
     }
+
+    namespace {
+
+        // Kahan-Neumaier compensated summation. Naive `s += v` loses ~ulp
+        // per term and on long sessions with mixed-sign values near zero
+        // (QPC noise floor + a target layer that genuinely runs free) the
+        // accumulated error can flip the .4f-rounded mean we print in the
+        // CSV header. Python's statistics.fmean uses a similar compensated
+        // strategy, so matching here keeps the byte-equivalence contract
+        // on long real-world sessions, not just on short fixtures.
+        double KahanNeumaierSum(const std::vector<double>& v) {
+            double sum = 0.0;
+            double c = 0.0;  // running compensation for lost low-order bits
+            for (double x : v) {
+                const double t = sum + x;
+                if (std::abs(sum) >= std::abs(x)) {
+                    c += (sum - t) + x;
+                } else {
+                    c += (x - t) + sum;
+                }
+                sum = t;
+            }
+            return sum + c;
+        }
+
+    } // namespace
 
     MergeStats ComputeStats(const std::vector<MergedRow>& merged) {
         MergeStats stats{};
@@ -161,15 +257,12 @@ namespace openxr_api_layer::merge {
             }
         }
         // ms_values always non-empty because merged is non-empty.
-        double sum = 0.0;
-        for (double v : ms_values) sum += v;
-        stats.target_ms_mean = sum / ms_values.size();
+        stats.target_ms_mean = KahanNeumaierSum(ms_values) / ms_values.size();
         stats.target_ms_min = *std::min_element(ms_values.begin(), ms_values.end());
         stats.target_ms_max = *std::max_element(ms_values.begin(), ms_values.end());
         if (!pct_values.empty()) {
-            sum = 0.0;
-            for (double v : pct_values) sum += v;
-            stats.target_pct_mean = sum / pct_values.size();
+            stats.target_pct_mean =
+                KahanNeumaierSum(pct_values) / pct_values.size();
             stats.target_pct_min =
                 *std::min_element(pct_values.begin(), pct_values.end());
             stats.target_pct_max =

@@ -13,7 +13,6 @@ Run:
 """
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -38,17 +37,32 @@ def write_raw_csv(path: Path, side: str, qpc_freq: int,
             fh.write(f"{fi},{tid},{qe},{qx}\n")
 
 
-def run_analyze(pre: Path, post: Path, out: Path | None = None) -> tuple[int, str, str]:
+def run_analyze(pre: Path, post: Path, out: Path | None = None,
+                cwd: Path | None = None) -> tuple[int, str, str]:
     """Run analyze.py as a subprocess. Returns (returncode, stdout, stderr).
 
     Subprocess (rather than direct import) keeps the test honest about how
     users actually invoke the script -- argparse, stderr warnings, exit
     codes all come through unchanged.
+
+    encoding='utf-8' is explicit so the test does not blow up on a
+    Windows runner whose locale.getpreferredencoding() is cp1252 the
+    moment analyze.py grows a non-ASCII character in any error message.
+
+    cwd is forwarded to subprocess.run rather than mutating the parent
+    process's working directory via os.chdir, so pytest-xdist (or any
+    future concurrent test) cannot race on a global resource.
     """
     cmd = [sys.executable, str(ANALYZE), str(pre), str(post)]
     if out is not None:
         cmd += ["--out", str(out)]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=str(cwd) if cwd is not None else None,
+    )
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -78,15 +92,12 @@ def test_default_out_path_falls_back_when_input_doesnt_match_naming(
     write_raw_csv(pre, "pre", 10_000_000, [(0, 1, 100, 200)])
     write_raw_csv(post, "post", 10_000_000, [(0, 1, 110, 190)])
 
-    # CWD must be a writable dir for the fallback default to work.
-    cwd_before = Path.cwd()
-    os.chdir(tmp_path)
-    try:
-        rc, _, _ = run_analyze(pre, post)
-        assert rc == 0
-        assert (tmp_path / "frames-merged.csv").exists()
-    finally:
-        os.chdir(cwd_before)
+    # Forward cwd= to subprocess instead of mutating the test process's
+    # working directory -- the latter races with pytest-xdist workers and
+    # any other test that reads Path.cwd().
+    rc, _, _ = run_analyze(pre, post, cwd=tmp_path)
+    assert rc == 0
+    assert (tmp_path / "frames-merged.csv").exists()
 
 
 # ----------------------------------------------------------------------------
@@ -219,19 +230,34 @@ def test_last_frame_per_thread_has_blank_interval_and_pct(tmp_path: Path) -> Non
     rc, _, _ = run_analyze(pre, post)
     assert rc == 0
     text = (tmp_path / "frames-merged-1.csv").read_text(encoding="utf-8")
-    lines = [l for l in text.splitlines() if l and not l.startswith("#")]
-    # First line is the column header.
-    assert lines[0].startswith("frame_idx,thread_id")
-    # Data rows: 3 of them.
-    data = lines[1:]
-    assert len(data) == 3
-    # Sort: (thread 1 frame 0), (thread 1 frame 1), (thread 2 frame 0).
-    # Frames 1 and 2 (last per thread) end with two trailing commas (empty
-    # frame_interval_us / empty target_pct_of_frame at the row end).
-    assert data[1].endswith(",,") is False  # only target_pct empty
-    assert data[2].endswith(",")  # target_pct empty
-    # First row has both filled.
-    assert ",," not in data[0].split(",", 2)[2].split(",")[0]
+
+    # Sort order produced by analyze.py is (thread_id, frame_idx):
+    #   row 0 = thread 1, frame 0  (has successor on thread 1)
+    #   row 1 = thread 1, frame 1  (no successor on thread 1)
+    #   row 2 = thread 2, frame 0  (only frame on thread 2)
+    # Columns: frame_idx, thread_id, frame_interval_us, pre_us, post_us,
+    #          target_us, target_pct_of_frame.
+    rows = [
+        line.split(",")
+        for line in text.splitlines()
+        if line and not line.startswith("#") and not line.startswith("frame_idx")
+    ]
+    assert len(rows) == 3
+
+    # Row 0 (thread 1, frame 0): has successor -> interval AND pct populated.
+    assert rows[0][:2] == ["0", "1"]
+    assert rows[0][2] != "", "thread1/frame0 must have a frame_interval_us"
+    assert rows[0][6] != "", "thread1/frame0 must have a target_pct_of_frame"
+
+    # Row 1 (thread 1, frame 1): no successor on thread 1 -> both blank.
+    assert rows[1][:2] == ["1", "1"]
+    assert rows[1][2] == "", "thread1/frame1 must have empty frame_interval_us"
+    assert rows[1][6] == "", "thread1/frame1 must have empty target_pct_of_frame"
+
+    # Row 2 (thread 2, frame 0): only frame on thread 2 -> both blank.
+    assert rows[2][:2] == ["0", "2"]
+    assert rows[2][2] == "", "thread2/frame0 must have empty frame_interval_us"
+    assert rows[2][6] == "", "thread2/frame0 must have empty target_pct_of_frame"
 
 
 def test_multiple_threads_sort_by_thread_then_frame(tmp_path: Path) -> None:

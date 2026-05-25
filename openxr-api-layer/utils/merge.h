@@ -47,10 +47,23 @@ namespace openxr_api_layer::merge {
     // Result of parsing a per-side CSV. qpc_freq comes from the
     // "# qpc_freq=..." header line; if the header is missing or malformed,
     // ReadFrameCsv falls back to whatever defaultFreq the caller passed.
+    //
+    // header_valid = false flags the "user pointed us at a merged CSV by
+    // mistake" case (or any other file whose column-header line is not
+    // exactly `frame_idx,thread_id,qpc_entry,qpc_exit`). Callers should
+    // refuse to merge such input rather than silently producing zero
+    // matched rows. The Python analyzer enforces the same contract via
+    // a SystemExit with the same error wording.
     struct ParsedFrameCsv {
         std::vector<RawFrameRow> rows;
         int64_t qpc_freq;
+        bool header_valid;
     };
+
+    // Expected raw per-side CSV column header, exactly. Any deviation
+    // (including the 7-column merged-CSV header) is rejected.
+    inline constexpr const char* kExpectedColumnHeader =
+        "frame_idx,thread_id,qpc_entry,qpc_exit";
 
     // One row of the merged CSV. Optionals are blanked out for the last
     // frame per thread (no successor -> no interval -> no pct).
@@ -94,6 +107,23 @@ namespace openxr_api_layer::merge {
     // from pre.qpc_entry deltas (per thread), and sets target_pct_of_frame
     // accordingly. Result is sorted by (thread_id, frame_idx) for
     // deterministic CSV output. Rows missing from either side are dropped.
+    //
+    // Each (frame_idx, thread_id) post entry is CONSUMED on match (like
+    // analyze.py's post_index.pop), so duplicate pre keys do not double-
+    // count against the same post entry -- output row count equals number
+    // of matched pairs, never more.
+    //
+    // preFreq is authoritative for BOTH sides (matches the Python analyzer
+    // which uses pre.qpc_freq after warning on mismatch). postFreq is
+    // currently ignored; kept in the signature for future cross-machine
+    // bridging support, and so callers know there is one freq per side
+    // they need to ferry through to here. The mismatch is the caller's
+    // responsibility to warn about.
+    //
+    // Rows where the next-per-thread interval would be <= 0 (TSC went
+    // backwards across a core migration on non-invariant hardware) get
+    // frame_interval_us / target_pct_of_frame left blank, matching the
+    // last-frame-per-thread case.
     std::vector<MergedRow> ComputeMerge(
         const std::vector<RawFrameRow>& preRows, int64_t preFreq,
         const std::vector<RawFrameRow>& postRows, int64_t postFreq);

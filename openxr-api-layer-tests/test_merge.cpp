@@ -44,6 +44,7 @@
 
 #include "utils/merge.h"
 
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <random>
@@ -59,16 +60,25 @@ using namespace openxr_api_layer::merge;
 
 namespace {
 
-    // Create a temporary directory unique to this test process. Each test
-    // case writes its synthetic CSVs here, so leftover files between tests
-    // do not cross-contaminate. The directory is reused (per process) to
-    // keep things cheap; tests write to uniquely-named files.
+    // Per-process directory for the test fixtures. The name mixes a
+    // monotonic high-resolution timestamp captured once at startup and
+    // four random_device draws -- so the two CI matrix shards
+    // (Release / Debug) running on the same windows-2022 image never
+    // collide, even if std::random_device happens to share seed across
+    // processes. No <windows.h> needed.
     fs::path TestTempDir() {
         static const fs::path dir = [] {
+            const auto now =
+                std::chrono::high_resolution_clock::now()
+                    .time_since_epoch()
+                    .count();
+            std::random_device rd;
+            const std::string unique =
+                std::to_string(static_cast<long long>(now)) + "_" +
+                std::to_string(rd()) + "_" + std::to_string(rd()) + "_" +
+                std::to_string(rd()) + "_" + std::to_string(rd());
             auto p = fs::temp_directory_path() /
-                     ("openxr_layer_monitor_tests_" +
-                      std::to_string(static_cast<unsigned long long>(
-                          std::random_device{}())));
+                     ("openxr_layer_monitor_tests_" + unique);
             std::error_code ec;
             fs::create_directories(p, ec);
             return p;
@@ -121,6 +131,9 @@ TEST_CASE("ReadFrameCsv: missing file returns empty rows and default freq") {
     const auto parsed = ReadFrameCsv(path, /*defaultFreq=*/12345);
     CHECK(parsed.rows.empty());
     CHECK(parsed.qpc_freq == 12345);
+    // Missing file is NOT a header violation -- the caller distinguishes
+    // "absent" from "wrong shape" via header_valid + rows.empty() combo.
+    CHECK(parsed.header_valid);
 }
 
 TEST_CASE("ReadFrameCsv: parses qpc_freq header") {
@@ -144,16 +157,29 @@ TEST_CASE("ReadFrameCsv: missing qpc_freq header falls back to defaultFreq") {
 }
 
 TEST_CASE("ReadFrameCsv: malformed qpc_freq value keeps defaultFreq") {
-    const fs::path path = TestTempDir() / "rfc_badfreq.csv";
-    {
-        std::ofstream out(path);
-        out << "# qpc_freq=not_a_number\n"
-            << "frame_idx,thread_id,qpc_entry,qpc_exit\n"
-            << "0,1,10,20\n";
-    }
-    const auto parsed = ReadFrameCsv(path, /*defaultFreq=*/42);
-    CHECK(parsed.qpc_freq == 42);
-    CHECK(parsed.rows.size() == 1);
+    // All-letters, scientific notation (`1e7` would silently become 1 with
+    // std::stoll), and trailing garbage (`10000000 Hz`). Each must fall
+    // back to defaultFreq rather than be truncated to a wrong integer.
+    auto check_falls_back = [](const std::string& freqLiteral,
+                                const char* tag) {
+        INFO("freq literal: " << freqLiteral << " (" << tag << ")");
+        const fs::path path =
+            TestTempDir() / ("rfc_badfreq_" + std::string(tag) + ".csv");
+        {
+            std::ofstream out(path);
+            out << "# qpc_freq=" << freqLiteral << "\n"
+                << "frame_idx,thread_id,qpc_entry,qpc_exit\n"
+                << "0,1,10,20\n";
+        }
+        const auto parsed = ReadFrameCsv(path, /*defaultFreq=*/42);
+        CHECK(parsed.qpc_freq == 42);
+        CHECK(parsed.rows.size() == 1);
+        CHECK(parsed.header_valid);
+    };
+    check_falls_back("not_a_number", "letters");
+    check_falls_back("1e7", "scientific");
+    check_falls_back("10000000 Hz", "trailing");
+    check_falls_back("", "empty");
 }
 
 TEST_CASE("ReadFrameCsv: empty lines and stray comments are ignored") {
@@ -174,6 +200,40 @@ TEST_CASE("ReadFrameCsv: empty lines and stray comments are ignored") {
     REQUIRE(parsed.rows.size() == 2);
     CHECK(parsed.rows[0].frame_idx == 0);
     CHECK(parsed.rows[1].frame_idx == 1);
+}
+
+TEST_CASE("ReadFrameCsv: header_valid is false when the column header does not "
+          "match the spec (e.g. merged CSV fed in by mistake)") {
+    // Simulate a frames-merged-<pid>.csv fed in where the per-side CSV
+    // belongs. Its first non-comment line lists seven columns, not four.
+    const fs::path path = TestTempDir() / "rfc_merged_by_mistake.csv";
+    {
+        std::ofstream out(path);
+        out << "# frame_count=42\n"
+            << "# target_ms_mean=0.0123\n"
+            << "frame_idx,thread_id,frame_interval_us,pre_us,post_us,"
+               "target_us,target_pct_of_frame\n"
+            << "0,1,11100.000,1.234,0.123,1.111,0.0100\n";
+    }
+    const auto parsed = ReadFrameCsv(path, /*defaultFreq=*/10'000'000);
+    CHECK_FALSE(parsed.header_valid);
+    CHECK(parsed.rows.empty());
+}
+
+TEST_CASE("ReadFrameCsv: trailing CR on the column header still validates") {
+    // CRLF on the column-header line must not fail validation -- the user
+    // may produce CSVs on Windows where every line is \r\n.
+    const fs::path path = TestTempDir() / "rfc_crlf_header.csv";
+    {
+        std::ofstream out(path, std::ios::out | std::ios::binary);
+        out << "# qpc_freq=10000000\r\n"
+            << "frame_idx,thread_id,qpc_entry,qpc_exit\r\n"
+            << "0,1,10,20\r\n";
+    }
+    const auto parsed = ReadFrameCsv(path, 0);
+    CHECK(parsed.header_valid);
+    CHECK(parsed.qpc_freq == 10'000'000);
+    CHECK(parsed.rows.size() == 1);
 }
 
 TEST_CASE("ReadFrameCsv: a row with too few fields is skipped not crashed") {
@@ -324,15 +384,60 @@ TEST_CASE("ComputeMerge: output sorted by (thread_id, frame_idx) regardless of i
     CHECK(m[3].frame_idx == 5);
 }
 
-TEST_CASE("ComputeMerge: different qpc_freq pre vs post still applies per-side scaling") {
-    // pre runs at 10M Hz, post at 1M Hz (unrealistic, but stresses the math).
-    const std::vector<RawFrameRow> pre = {Row(0, 1, 0, 1'000'000)};   // 100 ms
-    const std::vector<RawFrameRow> post = {Row(0, 1, 0, 50'000)};     // 50 ms
+TEST_CASE("ComputeMerge: preFreq is authoritative for both sides (matches analyze.py)") {
+    // Contract per merge.h: postFreq is currently ignored, preFreq is
+    // applied uniformly. analyze.py:147 does the same after warning about
+    // the mismatch. So post's ticks here are scaled by preFreq=10M, not
+    // by postFreq=1M; that is the WHOLE point of the new contract.
+    const std::vector<RawFrameRow> pre = {Row(0, 1, 0, 1'000'000)};
+    const std::vector<RawFrameRow> post = {Row(0, 1, 0, 500'000)};
     const auto m = ComputeMerge(pre, 10'000'000, post, 1'000'000);
     REQUIRE(m.size() == 1);
+    // pre: 1_000_000 ticks / 10_000_000 Hz * 1e6 = 100_000 us.
     CHECK(m[0].pre_us == doctest::Approx(100'000.0));
+    // post: 500_000 ticks / 10_000_000 Hz (preFreq!) * 1e6 = 50_000 us.
+    // If we used postFreq=1_000_000, this would be 500_000 us instead.
     CHECK(m[0].post_us == doctest::Approx(50'000.0));
     CHECK(m[0].target_us == doctest::Approx(50'000.0));
+}
+
+TEST_CASE("ComputeMerge: duplicate pre rows do not double-count against a single post entry") {
+    // Two pre rows share the same (frame_idx, thread_id) -- defensive
+    // against a future writer-thread retry or any other source of dupes.
+    // The first match consumes the post entry; the second sees no match
+    // and is dropped. Output count = matched pairs, never inflated.
+    const std::vector<RawFrameRow> pre = {
+        Row(0, 1, 100, 200),
+        Row(0, 1, 100, 200),  // duplicate
+    };
+    const std::vector<RawFrameRow> post = {
+        Row(0, 1, 110, 190),  // single post entry
+    };
+    const auto m = ComputeMerge(pre, 1'000'000, post, 1'000'000);
+    CHECK(m.size() == 1);
+}
+
+TEST_CASE("ComputeMerge: non-positive frame_interval leaves the interval + pct blank") {
+    // qpc_entry[i+1] < qpc_entry[i] on the same thread happens on
+    // non-invariant TSC hardware after a core migration. The "interval"
+    // is undefined; emitting a negative number downstream would confuse
+    // any tool that divides by it.
+    const std::vector<RawFrameRow> pre = {
+        Row(0, 1, 1'000, 1'500),     // pre.qpc_entry = 1000
+        Row(1, 1, 900, 1'400),       // next pre.qpc_entry = 900 (< 1000)
+    };
+    const std::vector<RawFrameRow> post = {
+        Row(0, 1, 1'100, 1'400),
+        Row(1, 1, 950, 1'350),
+    };
+    const auto m = ComputeMerge(pre, 1'000'000, post, 1'000'000);
+    REQUIRE(m.size() == 2);
+    // First row (frame 0) has a NEGATIVE interval (900 - 1000 = -100).
+    // Both interval and pct must be blank, NOT a negative number.
+    CHECK_FALSE(m[0].frame_interval_us.has_value());
+    CHECK_FALSE(m[0].target_pct_of_frame.has_value());
+    // Second row (frame 1) is last per thread -> also blank, as before.
+    CHECK_FALSE(m[1].frame_interval_us.has_value());
 }
 
 // ============================================================================
@@ -466,7 +571,12 @@ TEST_CASE("WriteMergedCsv: data row format matches the .3f/.4f contract") {
     CHECK(s.find("1,42,,2.000,1.000,1.000,") != std::string::npos);
 }
 
-TEST_CASE("WriteMergedCsv: output uses LF line endings only") {
+TEST_CASE("WriteMergedCsv: output uses LF line endings on disk via a binary ofstream") {
+    // Round-trip through a real std::ofstream opened in binary mode, then
+    // re-read as raw bytes. This exercises the layer.cpp:std::ios::binary
+    // contract -- an in-memory std::ostringstream check (used previously)
+    // could not catch a regression where someone drops the binary flag,
+    // because ostringstream is mode-agnostic.
     std::vector<MergedRow> merged(1);
     merged[0].frame_idx = 0;
     merged[0].thread_id = 1;
@@ -475,11 +585,21 @@ TEST_CASE("WriteMergedCsv: output uses LF line endings only") {
     merged[0].target_us = 1.0;
 
     const auto stats = ComputeStats(merged);
-    std::ostringstream out;
-    WriteMergedCsv(out, merged, stats);
-
-    const std::string s = out.str();
-    CHECK(s.find('\r') == std::string::npos);
+    const fs::path path = TestTempDir() / "wmc_lf_disk.csv";
+    {
+        std::ofstream out(path,
+                          std::ios::out | std::ios::trunc | std::ios::binary);
+        REQUIRE(out);
+        WriteMergedCsv(out, merged, stats);
+    }
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE(in);
+    const std::string bytes((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>{});
+    CHECK(bytes.find('\r') == std::string::npos);
+    // Sanity: the file should contain at least one '\n' (otherwise the
+    // CHECK above would trivially pass on an empty file).
+    CHECK(bytes.find('\n') != std::string::npos);
 }
 
 // ============================================================================

@@ -223,7 +223,11 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest
+          # Pin pytest so a v1.x.y tag re-triggered six months later
+          # cannot fail because of an upstream pytest major bump. Bumping
+          # this requires re-running the suite locally against the new
+          # version first.
+          python -m pip install "pytest==8.4.2"
           python -m pytest scripts/test_analyze.py -v
           if ($LASTEXITCODE -ne 0) {
             throw "pytest scripts/test_analyze.py returned $LASTEXITCODE"
