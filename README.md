@@ -9,14 +9,22 @@ many microseconds the target layer burned on the frame thread, per frame.
 app -> ..._pre -> <target layer> -> ..._post -> runtime
 ```
 
-Each side records a `QueryPerformanceCounter` timestamp on entry to and
-exit from its own `xrEndFrame`. The runtime + compositor live below both
-brackets and cancel out in the subtraction; what's left is the target's
-own work:
+Each side records a `QueryPerformanceCounter` timestamp around its own
+`xrEndFrame`. The pre side uses a NARROW bracket (just the call to the
+next layer); the post side uses a WIDE bracket that opens at the very
+first line of its xrEndFrame and closes just before the lock-free CSV
+append. When pre subtracts post's bracket, the runtime + compositor +
+**post's own per-frame bookkeeping** all cancel out, leaving only the
+target layer's actual work:
 
 ```
 target_cpu = (pre exit - pre entry) - (post exit - post entry)
 ```
+
+Residual measurement bias on the post side is about **~25 ns** (the
+SPSC ring `Push` + function return that live after `qpc_exit_post`).
+For target layers in the µs-to-ms range this is well below the QPC
+noise floor; even a sub-µs target layer is mostly faithfully measured.
 
 ## What you can do with it
 

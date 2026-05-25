@@ -292,16 +292,19 @@ namespace openxr_api_layer {
 
         // ---- Background CSV writer -----------------------------------------
         //
-        // The frame thread does the cheapest possible thing: take a brief
-        // mutex, push a tiny POD, signal the cv if the queue was empty. The
-        // writer thread does the slow stuff (formatting, fwrite, periodic
-        // flush) entirely off the critical path.
+        // The frame thread does the cheapest possible thing: a single
+        // SPSC ring-buffer push (two atomic stores + one branch, ~15-20 ns
+        // on modern x86). No mutex, no condition_variable signal, no
+        // heap allocation. The writer thread polls the ring at ~10 ms
+        // intervals and drains it.
         //
-        // Synchronous I/O in xrEndFrame would inflate pre.bracket by however
-        // long the fwrite took -- and because pre.bracket subsumes post's own
-        // fwrite, post's I/O cost would be attributed to the target layer.
-        // The whole point of this layer is that target_cpu measurements are
-        // trustworthy, so the background thread is non-optional.
+        // WHY LOCK-FREE: post.bracket subtracts everything inside post's
+        // xrEndFrame from pre.bracket. Whatever still sits OUTSIDE post's
+        // bracket (the Append call + return epilogue) ends up attributed
+        // to the target layer. A mutex lock costs ~100 ns under
+        // contention; a ring push costs ~20 ns. With the wide-bracket
+        // change, this delta IS the residual target_us bias for sub-µs
+        // target layers.
 
         struct FrameRow {
             uint64_t frame_idx;
@@ -310,30 +313,120 @@ namespace openxr_api_layer {
             int64_t qpc_exit;
         };
 
+        // SPSC ring buffer with a single producer (frame thread) and a
+        // single consumer (writer thread). N must be a power of two so
+        // the index wrap is a cheap bitmask instead of a modulo divide.
+        //
+        // SINGLE-PRODUCER CONTRACT: Push() does a plain `load + store`
+        // pair on m_head, NOT a CAS. Concurrent producers would race on
+        // the same slot and tear the FrameRow write. The contract is
+        // satisfied today because the OpenXR spec requires per-session
+        // xrEndFrame serialization, and the layer holds one OpenXrLayer
+        // (one g_csv) per XrInstance. A future multi-session host that
+        // calls xrEndFrame concurrently from two sessions of the same
+        // XrInstance would break this -- the fix would be either to
+        // intercept xrCreateSession and refuse the second one, or to
+        // upgrade Push to a CAS-based MPSC variant. Today's overlay /
+        // compositor uses a SEPARATE XrInstance so the contract holds.
+        //
+        // Size: 4096 * sizeof(Slot) = 256 KiB per FrameCsvSink. With one
+        // row per host xrEndFrame at 90 Hz, the ring buffers ~45 s of
+        // records -- more than enough to absorb any disk hiccup. If it
+        // ever does overflow, Push returns false and the caller bumps a
+        // dropped counter; the row is dropped, the frame thread does
+        // NOT block.
+        template <typename T, size_t N>
+        class SpscRingBuffer {
+            static_assert((N & (N - 1)) == 0, "N must be a power of two");
+            static constexpr size_t kMask = N - 1;
+
+            // Each slot lives on its own cache line. alignas on the
+            // array base alone (the original layout) only aligned the
+            // first slot -- adjacent FrameRow entries (32 bytes each)
+            // would still share a 64-byte line, recreating the
+            // producer/consumer false-sharing that we tried to avoid
+            // with the head/tail padding below.
+            struct alignas(64) Slot {
+                T value;
+            };
+
+          public:
+            // Producer: returns false if full. ~15-20 ns on x86 (relaxed
+            // load, acquire load, conditional, store, release store).
+            bool Push(const T& item) {
+                const size_t head = m_head.load(std::memory_order_relaxed);
+                const size_t next = (head + 1) & kMask;
+                if (next == m_tail.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                m_buffer[head].value = item;
+                m_head.store(next, std::memory_order_release);
+                return true;
+            }
+
+            // Consumer: returns false if empty.
+            bool Pop(T& out) {
+                const size_t tail = m_tail.load(std::memory_order_relaxed);
+                if (tail == m_head.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                out = m_buffer[tail].value;
+                m_tail.store((tail + 1) & kMask, std::memory_order_release);
+                return true;
+            }
+
+            bool ConsumerEmpty() const {
+                return m_tail.load(std::memory_order_relaxed) ==
+                       m_head.load(std::memory_order_acquire);
+            }
+
+          private:
+            // 64-byte padding so head and tail live on different cache
+            // lines -- avoids the classic SPSC false-sharing where the
+            // producer's head store invalidates the consumer's tail
+            // cache line on every push.
+            alignas(64) std::atomic<size_t> m_head{0};
+            alignas(64) std::atomic<size_t> m_tail{0};
+            alignas(64) Slot m_buffer[N]{};
+        };
+
         class FrameCsvSink {
           public:
+            // The g_csv instance lives at namespace scope and is destroyed
+            // during DLL unload. If the host terminated via TerminateProcess
+            // / Alt+F4 / anti-cheat kill / a crash mid-recording,
+            // xrDestroyInstance was never called, OpenXrLayer's destructor
+            // never ran, and the writer thread is still joinable. Without
+            // this destructor, ~std::thread on a joinable thread invokes
+            // std::terminate during teardown -- the layer would crash the
+            // host's exit path. Stop() is idempotent so a clean shutdown
+            // path (where ApplyToggle(false) already stopped the writer)
+            // passes through here harmlessly.
+            ~FrameCsvSink() { Stop(); }
+
             // Throws std::system_error if std::thread construction fails
             // (e.g., thread resource exhaustion), or std::runtime_error if
             // we are wedged from a previous failed Stop() join. Callers
             // (ApplyToggle) wrap the call so the exception never reaches
             // xrEndFrame.
-            //
-            // On thread-ctor failure the m_running flag is rolled back so a
-            // subsequent Start() can retry; without the rollback we would
-            // have a m_running=true zombie state with no live thread, and
-            // every Append() would silently accumulate forever.
             void Start() {
                 if (m_wedged.load(std::memory_order_acquire)) {
                     // A previous Stop() had to detach because join() threw.
                     // The orphaned writer thread may still hold the CSV
                     // file open; spawning a new one would race on the
-                    // shared queue / mutex / CSV file. Refuse instead --
-                    // recovery requires a process restart, which is no
-                    // worse than the original join failure.
+                    // shared ring + CSV file. Refuse -- recovery requires
+                    // a process restart.
                     throw std::runtime_error(
                         "FrameCsvSink wedged after a prior detach; "
                         "restart the host process to recover");
                 }
+                // Reset BEFORE the CAS so an Start() that hits the
+                // running=true early-return still observes a fresh
+                // counter on the next Stop()->footer cycle. Symmetry
+                // with Stop()'s reset at the end ensures the counter
+                // is always cleared between sessions, never leaking
+                // drops across the boundary.
+                m_droppedQueueFull.store(0, std::memory_order_relaxed);
                 bool expected = false;
                 if (!m_running.compare_exchange_strong(expected, true)) {
                     return;
@@ -350,13 +443,28 @@ namespace openxr_api_layer {
             // (deadlock detection, invalid_argument). We swallow it,
             // detach as a last resort, and flip m_wedged so any future
             // Start() refuses to spawn a second writer that would race
-            // the orphaned one on the queue + CSV file (finding N3).
+            // the orphaned one on the ring + CSV file.
+            //
+            // Latency: prior to this commit Stop() relied on a sleep_for
+            // tick to expire (~15 ms on Windows without timeBeginPeriod).
+            // Now Stop signals the writer through a cv whose ONLY purpose
+            // is the stop wakeup -- Append() does NOT touch the cv, so
+            // the frame-thread fast path stays at ~20 ns. Stop's
+            // wake-then-join completes in under a millisecond in the
+            // common case.
             void Stop() noexcept {
                 bool expected = true;
                 if (!m_running.compare_exchange_strong(expected, false)) {
                     return;
                 }
-                m_cv.notify_all();
+                // The lock is held briefly only to ensure the wait_for
+                // predicate observes the m_running=false store above
+                // (the lock pairs with the unique_lock in Run()). The
+                // notify itself is mutex-free.
+                {
+                    std::lock_guard<std::mutex> lock(m_wake_mutex);
+                }
+                m_wake_cv.notify_all();
                 if (m_thread.joinable()) {
                     try {
                         m_thread.join();
@@ -373,35 +481,55 @@ namespace openxr_api_layer {
                 }
             }
 
+            // Frame-thread hot path. The whole xrEndFrame budget for the
+            // post side's residual bias hangs on this being cheap and
+            // never blocking. No mutex, no cv signal -- the writer
+            // polls (waking instantly only on Stop). Drop counter is
+            // bumped on overflow (~45 s of continuous disk-stall at
+            // 90 Hz before the ring fills).
+            //
+            // SINGLE PRODUCER ONLY (see SpscRingBuffer's contract).
             void Append(const FrameRow& row) {
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    m_queue.push_back(row);
+                if (!m_ring.Push(row)) {
+                    m_droppedQueueFull.fetch_add(
+                        1, std::memory_order_relaxed);
                 }
-                m_cv.notify_one();
+            }
+
+            // Acquire matches the producer's relaxed fetch_add: the
+            // synchronization that actually publishes the final counter
+            // value to the consumer happens via the m_running release
+            // store in Stop() and the m_thread.join() that pairs with
+            // the writer's exit. Stating acquire here makes the
+            // happens-before chain explicit for non-x86 readers.
+            uint64_t DroppedQueueFull() const {
+                return m_droppedQueueFull.load(std::memory_order_acquire);
             }
 
           private:
             void Run() {
                 // entry.cpp resolves localAppData to the SHARED base folder
-                // (suffix _pre / _post stripped), so we add the side back into
-                // the CSV filename to keep pre and post outputs distinct.
-                // PID also goes in the name so concurrent OpenXR processes
-                // don't trample each other.
+                // (suffix _pre / _post stripped), so we add the side back
+                // into the CSV filename to keep pre and post outputs
+                // distinct. PID also goes in the name so concurrent OpenXR
+                // processes don't trample each other.
                 const std::filesystem::path path =
                     localAppData / fmt::format("frames-{}-{}.csv",
                                                GetCurrentProcessId(), kSideStr);
 
                 // LAZY OPEN: defer truncation + header write until the
-                // FIRST batch with actual rows arrives. A parasitic toggle
-                // ON-then-OFF (Discord screenshot binding fires while the
-                // user is doing something else, then they hit Ctrl+F9 to
-                // cancel before any xrEndFrame Appends) used to wipe the
-                // previous session's CSV at writer-start time -- the file
-                // was opened with std::ios::trunc and the header written
-                // immediately, even when no rows were ever pushed. By
-                // delaying the open call, a zero-row session leaves the
-                // previous session's CSV intact on disk.
+                // FIRST batch with actual rows arrives. A parasitic
+                // toggle ON-then-OFF (Discord screenshot binding fires
+                // while the user is doing something else, then they hit
+                // Ctrl+F9 to cancel before any xrEndFrame Appends) used
+                // to wipe the previous session's CSV at writer-start
+                // time -- the file was opened with std::ios::trunc and
+                // the header written immediately, even when no rows
+                // were ever pushed. Combined with MergeIntoOutput's
+                // zero-frame guard, the result on disk is: a session
+                // that recorded zero rows leaves every previously
+                // existing file (per-side CSVs AND frames-merged) bit-
+                // for-bit untouched.
                 std::ofstream stream;
                 bool open_failed = false;
                 const auto ensureOpen = [&]() -> bool {
@@ -426,39 +554,63 @@ namespace openxr_api_layer {
                     return true;
                 };
 
-                std::vector<FrameRow> batch;
-                while (true) {
-                    {
-                        std::unique_lock<std::mutex> lock(m_mutex);
-                        m_cv.wait(lock, [this] {
-                            return !m_queue.empty() || !m_running.load();
-                        });
-                        batch.swap(m_queue);
+                const auto writeOne = [&](const FrameRow& r) {
+                    if (ensureOpen()) {
+                        stream << r.frame_idx << ',' << r.thread_id << ','
+                               << r.qpc_entry << ',' << r.qpc_exit << '\n';
                     }
+                };
 
-                    if (!batch.empty() && ensureOpen()) {
-                        for (const auto& r : batch) {
-                            stream << r.frame_idx << ',' << r.thread_id << ','
-                                   << r.qpc_entry << ',' << r.qpc_exit << '\n';
-                        }
+                // Poll loop. The 10 ms timeout caps the worst-case
+                // "row pushed but not yet flushed" window; on Windows
+                // without an active timeBeginPeriod, wait_for's
+                // underlying scheduler granularity is ~15 ms, so the
+                // steady-state poll cadence is "10 ms requested,
+                // ~15 ms observed". Stop() flips m_running AND notifies
+                // m_wake_cv, so the wait_for predicate fires
+                // immediately on stop -- the previous sleep_for-only
+                // design (no notify) paid the full ~15 ms tick on
+                // every toggle-OFF, which stacked with the merge stall
+                // directly on the frame thread.
+                FrameRow row{};
+                while (true) {
+                    bool drained_any = false;
+                    while (m_ring.Pop(row)) {
+                        writeOne(row);
+                        drained_any = true;
+                    }
+                    if (drained_any && stream.is_open()) {
                         stream.flush();
                     }
-                    batch.clear();
 
                     if (!m_running.load(std::memory_order_acquire)) {
-                        // Drain the trailing rows that may have arrived
-                        // between our last swap and the running=false flip.
-                        std::lock_guard<std::mutex> lock(m_mutex);
-                        if (!m_queue.empty() && ensureOpen()) {
-                            for (const auto& r : m_queue) {
-                                stream << r.frame_idx << ',' << r.thread_id << ','
-                                       << r.qpc_entry << ',' << r.qpc_exit << '\n';
-                            }
+                        // Final drain after running=false. Producer may
+                        // have pushed between our last Pop and the flip.
+                        while (m_ring.Pop(row)) {
+                            writeOne(row);
+                        }
+                        if (stream.is_open()) {
                             stream.flush();
                         }
-                        m_queue.clear();
+                        // Footer: surface drop counts so the user knows
+                        // if the ring overflowed during the session.
+                        // Quiet when zero so the common case stays clean.
+                        const auto drops = DroppedQueueFull();
+                        if (drops > 0 && ensureOpen()) {
+                            stream << "# session_end dropped_queue_full="
+                                   << drops << "\n";
+                            stream.flush();
+                        }
                         return;
                     }
+
+                    std::unique_lock<std::mutex> lock(m_wake_mutex);
+                    m_wake_cv.wait_for(
+                        lock, std::chrono::milliseconds(10),
+                        [this] {
+                            return !m_running.load(
+                                std::memory_order_acquire);
+                        });
                 }
             }
 
@@ -466,12 +618,22 @@ namespace openxr_api_layer {
             // Sticky terminal state set when Stop()->join() throws and we
             // have to detach the orphaned writer. Subsequent Start() calls
             // throw to prevent a second writer from racing the orphan on
-            // the queue + CSV file. Recovery is process restart only.
+            // the ring + CSV file.
             std::atomic<bool> m_wedged{false};
+            std::atomic<uint64_t> m_droppedQueueFull{0};
             std::thread m_thread;
-            std::mutex m_mutex;
-            std::condition_variable m_cv;
-            std::vector<FrameRow> m_queue;
+            // Stop-only wakeup. Append() never touches these (the frame
+            // thread stays lock-free); only Stop() ever calls notify.
+            // The writer waits on m_wake_cv with a 10 ms timeout, so
+            // new rows pushed between Stop and the previous Pop drain
+            // still hit disk on the final drain phase.
+            std::mutex m_wake_mutex;
+            std::condition_variable m_wake_cv;
+            // 4096 rows (~128 KiB) absorbs ~45 s of continuous 90-Hz
+            // recording even if the writer thread never gets a tick of
+            // CPU. Overflow is unreachable on a healthy machine; the
+            // counter is here to flag pathological disk stalls.
+            SpscRingBuffer<FrameRow, 4096> m_ring;
         };
 
         FrameCsvSink g_csv;
@@ -840,43 +1002,92 @@ namespace openxr_api_layer {
             return result;
         }
 
+        // xrEndFrame is split into two distinct code paths via constexpr
+        // because the bracket placement differs between pre and post:
+        //
+        // PRE (narrow bracket): the toggle decision + skipNext/monitoring
+        // checks happen OUTSIDE the bracket. Pre's bracket measures only
+        // the call to next, i.e. target.full_body + post.full_body. Pre's
+        // own overhead does not appear in the bracket and therefore not
+        // in target_us.
+        //
+        // POST (wide bracket): qpc_entry is taken at the VERY FIRST line
+        // of the function, qpc_exit just before the Append call. So
+        // post.bracket includes nearly everything post does -- including
+        // its observe / skipNext / monitoring overhead, the runtime call,
+        // the frame_idx increment, and the TraceLoggingWrite. When pre
+        // subtracts post.bracket, all of that cancels out, leaving
+        // target_us = target_layer's actual work + the lock-free
+        // ring.Push call (the only thing post does AFTER qpc_exit). With
+        // SPSC ring.Push at ~20 ns, residual target_us bias is ~20-30 ns
+        // -- about 10x better than the narrow-bracket version that
+        // inflated target_us by ~300-500 ns of post-side bookkeeping.
+        //
+        // Toggle-decision overhead in the no-monitoring case stays low:
+        // three GetAsyncKeyState calls (Ctrl, F9, RAlt for the AltGr
+        // mask) + one atomic exchange for pre; an acquire-load on
+        // shared->generation + a local comparison for post. Sub-
+        // microsecond on modern x86.
         XrResult xrEndFrame(XrSession session,
                             const XrFrameEndInfo* frameEndInfo) override {
-            // Toggle decision happens OUTSIDE the QPC bracket. Total
-            // overhead in the no-monitoring case: three GetAsyncKeyState
-            // calls (Ctrl, F9, RAlt for the AltGr mask) + one atomic
-            // exchange for pre; acquire-load on shared->generation +
-            // local comparison for post. Sub-microsecond on modern x86.
             if constexpr (kIsPreSide) {
-                // Pre is the authoritative poller. ApplyToggle handles the
-                // broadcast to shared memory internally, ONLY on success,
-                // so a Start() failure leaves shared state consistent with
-                // pre's actual local state.
+                // -------- PRE side --------
                 if (ConsumeHotkeyEdge()) {
-                    // Debounce: ignore the edge if the previous toggle was
-                    // under kDebounceMs ago. Catches OBS / ShadowPlay
-                    // instant-replay bindings that fire Ctrl+F9 twice in
-                    // rapid succession (a churned START/STOP would stall
-                    // the frame thread on the merge -- documented in the
-                    // README's Limitations section).
+                    // Debounce: ignore an edge that lands within
+                    // kDebounceMs of the previous toggle. Catches OBS /
+                    // ShadowPlay instant-replay bindings that fire
+                    // Ctrl+F9 twice in quick succession (a churned
+                    // START/STOP would stall the frame thread on the
+                    // merge -- documented in the README's Limitations).
                     constexpr int64_t kDebounceMs = 500;
                     const int64_t now = Qpc();
                     const int64_t freq = QpcFreqHz();
-                    const int64_t debounceTicks = (freq * kDebounceMs) / 1000;
+                    const int64_t debounceTicks =
+                        (freq * kDebounceMs) / 1000;
                     const int64_t last =
                         g_lastToggleQpc.load(std::memory_order_acquire);
                     if (last == 0 || (now - last) >= debounceTicks) {
-                        g_lastToggleQpc.store(now, std::memory_order_release);
+                        g_lastToggleQpc.store(
+                            now, std::memory_order_release);
                         ApplyToggle(
                             !g_monitoring.load(std::memory_order_acquire));
                     }
                 }
+
+                if (g_skipNext.load(std::memory_order_acquire) > 0) {
+                    g_skipNext.fetch_sub(1, std::memory_order_acq_rel);
+                    return OpenXrApi::xrEndFrame(session, frameEndInfo);
+                }
+                if (!g_monitoring.load(std::memory_order_acquire)) {
+                    return OpenXrApi::xrEndFrame(session, frameEndInfo);
+                }
+
+                // Narrow bracket -- pre's own work is OUTSIDE.
+                const int64_t qpc_entry = Qpc();
+                const XrResult result =
+                    OpenXrApi::xrEndFrame(session, frameEndInfo);
+                const int64_t qpc_exit = Qpc();
+
+                const uint64_t frame_idx =
+                    g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+                const uint32_t thread_id = GetCurrentThreadId();
+                TraceLoggingWrite(g_traceProvider,
+                                  "xrEndFrame",
+                                  TLArg(kSideStr, "Side"),
+                                  TLArg(frame_idx, "FrameIdx"),
+                                  TLArg(qpc_entry, "QpcEntry"),
+                                  TLArg(qpc_exit, "QpcExit"),
+                                  TLArg(qpc_exit - qpc_entry, "QpcDelta"));
+                g_csv.Append({frame_idx, thread_id, qpc_entry, qpc_exit});
+                return result;
             } else {
-                // Post follows what pre wrote to shared memory. The
-                // pre -> target -> post chain order means pre's write is
-                // visible here by virtue of release/acquire ordering on
-                // the generation counter. ApplyToggle on post is gated by
-                // a constexpr so it does NOT re-broadcast.
+                // -------- POST side (wide bracket) --------
+                //
+                // qpc_entry FIRST so post's observe / skipNext /
+                // monitoring overhead is INSIDE post.bracket and
+                // therefore canceled when pre subtracts.
+                const int64_t qpc_entry = Qpc();
+
                 if (auto* shared = GetSharedToggleState()) {
                     const uint64_t gen = shared->generation.load(
                         std::memory_order_acquire);
@@ -889,46 +1100,42 @@ namespace openxr_api_layer {
                         ApplyToggle(target);
                     }
                 }
+
+                if (g_skipNext.load(std::memory_order_acquire) > 0) {
+                    g_skipNext.fetch_sub(1, std::memory_order_acq_rel);
+                    return OpenXrApi::xrEndFrame(session, frameEndInfo);
+                }
+                if (!g_monitoring.load(std::memory_order_acquire)) {
+                    return OpenXrApi::xrEndFrame(session, frameEndInfo);
+                }
+
+                const XrResult result =
+                    OpenXrApi::xrEndFrame(session, frameEndInfo);
+
+                const uint64_t frame_idx =
+                    g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+                const uint32_t thread_id = GetCurrentThreadId();
+                // ETW emitted INSIDE post's bracket with qpc_entry only.
+                // qpc_exit is not known yet (we take it as late as
+                // possible, just before Append, so post's TraceLogging
+                // cost is itself absorbed by post.bracket). Real exit
+                // timestamps land in the CSV; consumers wanting WPA-side
+                // delta correlation should join the ETW stream to the
+                // CSV by (Side, FrameIdx).
+                TraceLoggingWrite(g_traceProvider,
+                                  "xrEndFrame",
+                                  TLArg(kSideStr, "Side"),
+                                  TLArg(frame_idx, "FrameIdx"),
+                                  TLArg(qpc_entry, "QpcEntry"));
+
+                // qpc_exit AS LATE AS POSSIBLE so post.bracket subsumes
+                // the bulk of post's work. The only things outside this
+                // are the ring.Push below (~20 ns) and the function
+                // return (~5 ns).
+                const int64_t qpc_exit = Qpc();
+                g_csv.Append({frame_idx, thread_id, qpc_entry, qpc_exit});
+                return result;
             }
-
-            // Skip the first frame after a toggle ON so the std::thread()
-            // spawn cost in ApplyToggle does not land inside any bracket.
-            // Both halves decrement in lockstep (each ApplyToggle sets
-            // skipNext=1) so the merge stays matched.
-            if (g_skipNext.load(std::memory_order_acquire) > 0) {
-                g_skipNext.fetch_sub(1, std::memory_order_acq_rel);
-                return OpenXrApi::xrEndFrame(session, frameEndInfo);
-            }
-
-            // Pass-through when monitoring is off. The host never knows
-            // the layer is even there until the user presses Ctrl+F9.
-            if (!g_monitoring.load(std::memory_order_acquire)) {
-                return OpenXrApi::xrEndFrame(session, frameEndInfo);
-            }
-
-            // The sandwich bracket. Keep this region free of work --
-            // no Log(), no string formatting, no allocations -- so the only
-            // cost the bracket sees is the OpenXrApi::xrEndFrame dispatch
-            // itself plus whatever sits downstream. Anything that runs here
-            // would be attributed to the target layer in the analyzer.
-            const int64_t qpc_entry = Qpc();
-            const XrResult result = OpenXrApi::xrEndFrame(session, frameEndInfo);
-            const int64_t qpc_exit = Qpc();
-
-            const uint64_t frame_idx =
-                g_frameCounter.fetch_add(1, std::memory_order_relaxed);
-            const uint32_t thread_id = GetCurrentThreadId();
-
-            TraceLoggingWrite(g_traceProvider,
-                              "xrEndFrame",
-                              TLArg(kSideStr, "Side"),
-                              TLArg(frame_idx, "FrameIdx"),
-                              TLArg(qpc_entry, "QpcEntry"),
-                              TLArg(qpc_exit, "QpcExit"),
-                              TLArg(qpc_exit - qpc_entry, "QpcDelta"));
-
-            g_csv.Append({frame_idx, thread_id, qpc_entry, qpc_exit});
-            return result;
         }
     };
 
