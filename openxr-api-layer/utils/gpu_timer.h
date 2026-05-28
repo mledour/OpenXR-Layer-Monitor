@@ -25,8 +25,8 @@
 // =============================================================================
 // GPU side of the sandwich profiler.
 //
-// THE GPU SANDWICH (D3D11)
-// ------------------------
+// THE GPU SANDWICH (D3D11 + D3D12)
+// --------------------------------
 // The CPU sandwich measures the target layer's xrEndFrame wall-clock cost by
 // bracketing the call with QPC on both the pre and post sides and subtracting.
 // The GPU sandwich does the same thing for GPU work, but a GPU timestamp is a
@@ -43,12 +43,18 @@
 //
 //   target_gpu_ns = (T_post - T_pre) / gpu_freq   (computed by the merge)
 //
-// Both DLLs hold the SAME ID3D11Device (the app's device, handed identically
-// to every layer through XrGraphicsBindingD3D11KHR), and timestamps on the
-// same device read the same monotonic GPU counter, so the two values are
-// directly subtractable. Each side wraps its single timestamp in its own tiny
-// D3D11_QUERY_TIMESTAMP_DISJOINT bracket to recover the clock frequency and a
-// "the clock was unstable at this instant" flag.
+// Both DLLs see the same app-provided device (D3D11) or (device, queue) pair
+// (D3D12), handed identically through XrGraphicsBindingD3D{11,12}KHR.
+// Timestamps on the same device/queue read the same monotonic GPU counter,
+// so the two values are directly subtractable.
+//
+//   D3D11: each side wraps its single timestamp in its own tiny D3D11_QUERY_
+//          TIMESTAMP_DISJOINT bracket to recover the clock frequency and a
+//          "the clock was unstable at this instant" flag.
+//   D3D12: each side issues EndQuery(TIMESTAMP) + ResolveQueryData on its
+//          own short command list, submitted to the app's command queue.
+//          D3D12 has no per-query disjoint flag; the queue's GetTimestamp
+//          Frequency() is trusted for the queue's lifetime.
 //
 // ASYNCHRONY
 // ----------
@@ -56,30 +62,45 @@
 // moment that command actually executes -- typically 1-3 frames later. So the
 // render thread can only READ frame N's timestamp once the GPU has caught up.
 // Each backend keeps a small ring (kGpuRingSize) of in-flight slots;
-// PollResolved() drains every slot whose GetData() has gone ready and emits
-// one GpuRow per resolved frame. The CSV is therefore a few frames behind the
+// PollResolved() drains every slot whose GPU result is ready and emits one
+// GpuRow per resolved frame. The CSV is therefore a few frames behind the
 // CPU CSV at any instant, which the merge tolerates (it joins on frame_idx and
 // leaves target_gpu_us blank for any frame missing a GPU row on either side).
 //
 // THREADING
 // ---------
-// Every method runs on the app's render thread (the thread that calls
-// xrEndFrame). The D3D11 immediate context is single-threaded, so RecordTimes
-// tamp / PollResolved / Reset must never be called from the CSV writer thread
-// or any helper thread.
+// IGpuTimer methods (RecordTimestamp, PollResolved, Reset) MUST run on the
+// app's render thread -- the same thread that calls xrEndFrame. This holds
+// for both backends:
+//   * D3D11's immediate context is single-threaded by API contract.
+//   * D3D12 has no immediate context, but our ring + per-slot fence values
+//     are plain (non-atomic) state -- they tolerate single-threaded use only.
+// The DroppedFrames() / BackendName() accessors are also single-thread
+// safe (atomic load + static literal return respectively). Callers running
+// on OTHER threads -- e.g. the GPU CSV writer thread reading the backend
+// name for the file header -- MUST serialise their access to the owning
+// std::unique_ptr<IGpuTimer> separately (the layer uses g_gpuTimerMutex
+// for this).
 //
 // LIMITATIONS (documented in the README too)
-//   * D3D11 only for now. D3D12 / Vulkan hosts get no GPU rows (the CPU
-//     sandwich still works); the merge leaves target_gpu_us blank.
-//   * Captures only GPU work the target submits on the app's immediate context
-//     between the two timestamps, in command-stream order. A target that
-//     renders on a deferred context, a private device, or a separate queue is
-//     invisible to this measurement.
-//   * The per-side disjoint bracket only covers the instant of each timestamp,
-//     not the whole span between them, so a GPU clock change DURING the
-//     target's work between T_pre and T_post may go unflagged. Clock changes
-//     are rare; re-run if a session looks suspicious. A frequency mismatch
-//     between the two sides IS caught and blanks the frame.
+//   * D3D11 and D3D12 are wired up; Vulkan / OpenGL hosts get no GPU rows
+//     (the CPU sandwich still works); the merge leaves target_gpu_us blank.
+//   * Captures only GPU work the target submits on the app's immediate
+//     context (D3D11) or render queue (D3D12) between the two timestamps,
+//     in command-stream order. A target that renders on a deferred context,
+//     a private device, or a separate queue is invisible to this
+//     measurement.
+//   * D3D11: the per-side disjoint bracket only covers the instant of each
+//     timestamp, not the whole span between them, so a GPU clock change
+//     DURING the target's work between T_pre and T_post may go unflagged.
+//     A frequency mismatch between the two sides IS caught and blanks the
+//     frame; clock changes are rare; re-run if a session looks suspicious.
+//   * D3D12: no per-query disjoint flag exists; the queue's frequency is
+//     trusted for its lifetime. A device removal (TDR) between Signal and
+//     Map can leave a row with valid=1 holding stale readback data -- the
+//     merge's post_ticks >= pre_ticks + frequency-match guards catch the
+//     common cases, but a coincidental match-after-corruption would not
+//     be detected. Re-run if a session crosses a TDR / driver restart.
 // =============================================================================
 
 #include <array>
@@ -256,18 +277,24 @@ namespace openxr_api_layer::gpu {
         // (truncated, frame_idx-reset-to-0) CSV.
         virtual void Reset() = 0;
 
-        // Cumulative count of frames the backend dropped because the GPU was
-        // more than the ring's capacity behind on readback (a >~44 ms stall
-        // at 90 Hz, kGpuRingSize=4). Surfaced in the GPU CSV footer so the
-        // user knows when a session's GPU timeline has gaps it cannot
-        // attribute. Monotonic; reset only by destroying the timer (i.e. on
-        // xrDestroySession, when a new instance is built on next create).
+        // Count of frames the backend dropped IN THE CURRENT SESSION because
+        // the GPU was more than the ring's capacity behind on readback (a
+        // >~44 ms stall at 90 Hz, kGpuRingSize=4). Surfaced in the GPU CSV
+        // footer so the user knows when a session's GPU timeline has gaps it
+        // cannot attribute. Cleared by Reset() (which ApplyToggle calls on
+        // every Ctrl+F9-on) so each session reports only ITS OWN drops --
+        // earlier wording said "monotonic across sessions" but that lied to
+        // the user: a clean second session would inherit the first session's
+        // overflow count in its footer.
         //
         // D3D11 overwrites the in-flight query and counts the dropped frame;
         // D3D12 instead SKIPS the new frame (D3D12 forbids resetting a
-        // command allocator while its commands execute) but bumps the same
-        // counter -- user-visible behaviour is identical: one frame's GPU
-        // sample is missing, the merge leaves target_gpu_us blank.
+        // command allocator while its commands execute) AND ALSO counts a
+        // drop when an overwrite-on-full is detected at Reserve() time (the
+        // ring's bookkeeping reused a slot whose previous PollResolved had
+        // not yet drained it -- silent CSV loss without this count).
+        // User-visible behaviour is identical: one frame's GPU sample is
+        // missing, the merge leaves target_gpu_us blank.
         virtual uint64_t DroppedFrames() const = 0;
 
         // Lowercase identifier of the active backend ("d3d11", "d3d12").

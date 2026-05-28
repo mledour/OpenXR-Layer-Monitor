@@ -186,6 +186,12 @@ namespace openxr_api_layer::gpu {
                 // to call from the frame thread inside ApplyToggle.
                 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-begin
                 m_ring.Reset();
+                // Clear the per-session drop counter too. Reset() runs at
+                // the start of every new Ctrl+F9 monitoring session; the
+                // GPU CSV footer's "# session_end gpu_ring_overflow=N"
+                // must reflect only THIS session's drops, not bleed from
+                // a previous session's stalls.
+                m_droppedFrames.store(0, std::memory_order_relaxed);
             }
 
             uint64_t DroppedFrames() const override {
@@ -259,11 +265,21 @@ namespace openxr_api_layer::gpu {
             ~GpuTimerD3D12() override {
                 // Drain in-flight GPU work before releasing the resources
                 // it references. D3D12 spec is strict that objects bound
-                // to submitted command lists must outlive their execution.
+                // to submitted command lists must outlive their execution
+                // -- the debug layer flags violations viciously, even
+                // though the runtime's reference counting protects us in
+                // release builds.
+                //
+                // Timeout cap: 200 ms, matching Reset(). The destructor is
+                // called from xrDestroySession (frame thread); a longer
+                // wait would block the host's session-teardown path. On a
+                // genuinely hung GPU the system is going to TDR anyway --
+                // we just want to give a sane GPU enough time to flush
+                // ~kGpuRingSize+1 tiny submissions.
                 if (m_active && m_fence && m_queue && m_fenceCounter > 0) {
                     const UINT64 v = ++m_fenceCounter;
                     if (SUCCEEDED(m_queue->Signal(m_fence.Get(), v))) {
-                        waitForFenceBounded(v, /*timeoutMs=*/1000);
+                        waitForFenceBounded(v, /*timeoutMs=*/200);
                     }
                 }
                 shutdownInternal();
@@ -336,7 +352,11 @@ namespace openxr_api_layer::gpu {
 
                 // Per-slot (allocator, command list). Created closed so the
                 // first Reset() in RecordTimestamp succeeds (newly-built
-                // command lists are open by default).
+                // command lists are open by default). Close() can fail on
+                // some debug-layer-enabled drivers when called on a zero-
+                // recorded-commands list -- treat the same as a creation
+                // failure rather than silently leaving the list open (a
+                // subsequent Reset would fail forever on that slot).
                 for (auto& slot : m_slots) {
                     if (FAILED(m_device->CreateCommandAllocator(
                             D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -348,8 +368,30 @@ namespace openxr_api_layer::gpu {
                         shutdownInternal();
                         return false;
                     }
-                    slot.cmdList->Close();
+                    if (FAILED(slot.cmdList->Close())) {
+                        shutdownInternal();
+                        return false;
+                    }
                     slot.fenceValue = 0;
+                }
+
+                // Persistent event handle used by waitForFenceBounded. We
+                // CANNOT close the event on every timeout: D3D12's
+                // SetEventOnCompletion does not document handle-duplication
+                // semantics, and the runtime may legitimately call SetEvent
+                // on this handle long after waitForFenceBounded returns
+                // false (when the fence eventually reaches the value). Re-
+                // using a long-lived event sidesteps the entire class of
+                // "SetEvent on a recycled HANDLE" bugs. wil::create()
+                // defaults to an auto-reset, non-signaled event; we
+                // additionally ResetEvent before each registration so a
+                // previous orphaned signal (a SetEventOnCompletion that
+                // fired but whose wait had already returned by timeout)
+                // doesn't immediately satisfy a wait for a different
+                // fence value.
+                if (FAILED(m_waitEvent.create())) {
+                    shutdownInternal();
+                    return false;
                 }
 
                 if (FAILED(m_device->CreateFence(
@@ -387,6 +429,20 @@ namespace openxr_api_layer::gpu {
 
                 // Now safe to advance the ring + reset the allocator.
                 const auto reserved = m_ring.Reserve(frame_idx);
+                // Reserve() may report overwrote_pending=true when the
+                // PRE-CHECK above passed (GPU is caught up on this slot)
+                // but the consumer hadn't yet drained the slot in
+                // PollResolved (it's still flagged Pending in our ring
+                // bookkeeping). That overwrite silently drops the previous
+                // frame's row from the CSV, so we count it the same way
+                // the D3D11 backend does. Without this bump,
+                // gpu_ring_overflow=N under-reports the user-visible
+                // gaps.
+                if (reserved.overwrote_pending) {
+                    m_droppedFrames.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+
                 if (FAILED(slot.allocator->Reset()) ||
                     FAILED(slot.cmdList->Reset(slot.allocator.Get(),
                                                nullptr))) {
@@ -419,8 +475,21 @@ namespace openxr_api_layer::gpu {
 
                 ID3D12CommandList* lists[] = { slot.cmdList.Get() };
                 m_queue->ExecuteCommandLists(1, lists);
-                slot.fenceValue = ++m_fenceCounter;
-                m_queue->Signal(m_fence.Get(), slot.fenceValue);
+                const UINT64 nextFenceValue = ++m_fenceCounter;
+                // Signal CAN fail (DEVICE_REMOVED on TDR, transient
+                // E_OUTOFMEMORY). If it does, the fence will never reach
+                // nextFenceValue and this slot becomes permanently un-
+                // drainable (the pre-check would block every wrap-around
+                // for the rest of the session). Use the sentinel fence
+                // value 0 so the slot is treated as "never submitted"
+                // and PollResolved skips it instead.
+                if (FAILED(m_queue->Signal(m_fence.Get(), nextFenceValue))) {
+                    m_droppedFrames.fetch_add(
+                        1, std::memory_order_relaxed);
+                    slot.fenceValue = 0;
+                    return;
+                }
+                slot.fenceValue = nextFenceValue;
             }
 
             void PollResolved(std::vector<GpuRow>& out) override {
@@ -482,19 +551,43 @@ namespace openxr_api_layer::gpu {
                 // ring bookkeeping. If we don't, a subsequent RecordTimestamp
                 // could see slot.fenceValue=0 (cleared below), think the
                 // allocator is free, and Reset() it while the GPU is still
-                // executing -- D3D12 debug layer raises and the recording
-                // is poisoned. Bounded wait so a hung GPU doesn't lock the
-                // frame thread indefinitely.
+                // executing -- D3D12 debug layer raises, release builds may
+                // TDR the host. Bounded wait so a truly hung GPU doesn't
+                // lock the frame thread indefinitely.
+                bool drained = true;
                 if (m_fence && m_queue && m_fenceCounter > 0) {
                     const UINT64 v = ++m_fenceCounter;
-                    if (SUCCEEDED(m_queue->Signal(m_fence.Get(), v))) {
-                        waitForFenceBounded(v, /*timeoutMs=*/200);
+                    if (FAILED(m_queue->Signal(m_fence.Get(), v))) {
+                        drained = false;
+                    } else if (!waitForFenceBounded(v, /*timeoutMs=*/200)) {
+                        // Wait timed out -- the GPU is >200 ms behind on the
+                        // last queued submission. We CANNOT clear the per-
+                        // slot fence values: the next RecordTimestamp's
+                        // pre-check is exactly what protects us from
+                        // Reset()-ing an in-flight allocator, and that check
+                        // relies on slot.fenceValue being non-zero. Leave
+                        // them in place and clear only the ring's logical
+                        // state (no consumer will read those slots since
+                        // m_ring is reset).
+                        drained = false;
                     }
                 }
-                for (auto& slot : m_slots) {
-                    slot.fenceValue = 0;
+                if (drained) {
+                    for (auto& slot : m_slots) {
+                        slot.fenceValue = 0;
+                    }
                 }
+                // m_ring.Reset() is safe in either branch: it only clears
+                // CPU bookkeeping (PeekOldest will return false), no D3D12
+                // resource is touched. Slots whose fenceValue we kept will
+                // still gate the next RecordTimestamp through the pre-check.
                 m_ring.Reset();
+                // Same as init(): per-session counts should reflect THIS
+                // session's drops, not bleed from the previous one. The
+                // user-facing footer "# session_end gpu_ring_overflow=N"
+                // would otherwise lie on every Ctrl+F9-OFF after a session
+                // that had drops.
+                m_droppedFrames.store(0, std::memory_order_relaxed);
             }
 
             uint64_t DroppedFrames() const override {
@@ -515,24 +608,44 @@ namespace openxr_api_layer::gpu {
                 m_fence.Reset();
                 m_queue.Reset();
                 m_device.Reset();
+                // Close the persistent wait event last -- after the fence is
+                // released, the runtime can no longer schedule a SetEvent on
+                // it, so closing the HANDLE is safe regardless of any
+                // earlier waitForFenceBounded timeout.
+                m_waitEvent.reset();
                 m_active = false;
             }
 
             // Block until the fence reaches `value`, or timeoutMs elapses.
-            // Returns false on timeout. Used both for shutdown drain and
-            // for the Reset() barrier; never on the per-frame hot path.
+            // Returns false on timeout. Used for shutdown drain + Reset()
+            // barrier; never on the per-frame hot path.
+            //
+            // The event handle is a PERSISTENT member (created in init()),
+            // not a fresh wil::unique_event per call: D3D12 does not
+            // document handle-duplication semantics for
+            // SetEventOnCompletion, and Microsoft samples consistently keep
+            // the event alive for the fence's lifetime. Closing a freshly-
+            // created event on a timeout return would risk the runtime
+            // later signaling a recycled HANDLE that ended up owned by an
+            // unrelated kernel object in the host process.
+            //
+            // Auto-reset semantics: ResetEvent before SetEventOnCompletion
+            // so a previous timed-out registration that DID later signal
+            // (but no one waited) doesn't immediately satisfy this wait
+            // for a different fence value.
             bool waitForFenceBounded(UINT64 value, DWORD timeoutMs) {
                 if (m_fence->GetCompletedValue() >= value) {
                     return true;
                 }
-                wil::unique_event_nothrow ev;
-                if (FAILED(ev.create())) {
+                if (!m_waitEvent.is_valid()) {
                     return false;
                 }
-                if (FAILED(m_fence->SetEventOnCompletion(value, ev.get()))) {
+                ::ResetEvent(m_waitEvent.get());
+                if (FAILED(m_fence->SetEventOnCompletion(value,
+                                                         m_waitEvent.get()))) {
                     return false;
                 }
-                return WaitForSingleObject(ev.get(), timeoutMs) ==
+                return WaitForSingleObject(m_waitEvent.get(), timeoutMs) ==
                        WAIT_OBJECT_0;
             }
 
@@ -550,6 +663,10 @@ namespace openxr_api_layer::gpu {
             ComPtr<ID3D12QueryHeap> m_queryHeap;
             ComPtr<ID3D12Resource> m_readback;
             ComPtr<ID3D12Fence> m_fence;
+            // Persistent auto-reset event used by waitForFenceBounded. See
+            // its method comment for why a per-call event is unsafe on
+            // timeout.
+            wil::unique_event_nothrow m_waitEvent;
             UINT64 m_fenceCounter = 0;
             UINT64 m_frequency = 0;
             std::array<Slot, kGpuRingSize> m_slots;
@@ -557,7 +674,9 @@ namespace openxr_api_layer::gpu {
             // Same semantics as D3D11's m_droppedFrames: counts frames whose
             // GPU sample we could not record because the GPU was too far
             // behind on readback. D3D12 SKIPS the frame (vs D3D11's
-            // overwrite) but the user-visible cost is the same.
+            // overwrite) but the user-visible cost is the same. Reset to 0
+            // on init() AND on Reset() (every Ctrl+F9-on starts a fresh
+            // session-local count).
             std::atomic<uint64_t> m_droppedFrames{0};
             bool m_active = false;
         };

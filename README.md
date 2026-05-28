@@ -519,14 +519,23 @@ the target layer's score.
     - **D3D12**: no per-query disjoint flag exists; the queue's
       `GetTimestampFrequency()` is trusted for the queue's lifetime
       (same convention OpenXR Toolkit / fpsVR / XrTelemetry use).
+      `valid=1` on a D3D12 row only means the readback `Map` succeeded,
+      *not* that the GPU clock was stable across the measured span.
+      A driver TDR (device removed) between `Signal` and `Map` can in
+      principle leave a row with `valid=1` holding the stale contents
+      of the readback buffer; the merge's `post_ticks >= pre_ticks`
+      and frequency-match guards catch the common shapes of corruption
+      but a coincidental match-after-corruption would not be detected.
+      Re-run any session that crossed a driver restart / TDR.
       Each frame's GPU instrumentation adds one tiny
       `ExecuteCommandLists` on the app's queue (an `EndQuery` + a
-      `ResolveQueryData` of a single `UINT64`); cost is well below
-      a sub-microsecond submission. If the GPU stalls beyond the
-      ring's depth (~44 ms at 90 Hz), the D3D12 backend SKIPS the
-      frame's GPU sample rather than crash on a forbidden command-
-      allocator reset, and bumps `# session_end gpu_ring_overflow`
-      in the GPU CSV footer to surface it.
+      `ResolveQueryData` of a single `UINT64`); CPU cost is a single-
+      digit-microsecond syscall sequence, kept OUT of the pre-side
+      bracket so it does not bias `target_us`. If the GPU stalls
+      beyond the ring's depth (~44 ms at 90 Hz), the D3D12 backend
+      SKIPS the frame's GPU sample rather than crash on a forbidden
+      command-allocator reset, and bumps `# session_end
+      gpu_ring_overflow` in the GPU CSV footer to surface it.
 - **Layer ordering is on you.** If a fourth layer slips between pre and
   the target (or between target and post), its CPU gets billed to the
   target. Always sanity-check `reg query` after install.

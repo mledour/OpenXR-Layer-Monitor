@@ -687,23 +687,58 @@ namespace openxr_api_layer {
         };
 
         // Per-DLL singleton GPU timer, recreated on each xrCreateSession and
-        // released on each xrDestroySession. Null on non-D3D11 hosts or if
-        // query creation failed. Only ever touched from the frame thread (the
-        // D3D11 immediate context is single-threaded), so a plain unique_ptr
-        // is sufficient -- no atomic. xrCreateSession happens-before the
-        // first xrEndFrame via the app's own handoff of the XrSession handle.
-        // Declared HERE (before GpuCsvTraits) so the GPU sink's footer code
-        // can read DroppedFrames() inline.
+        // released on each xrDestroySession. Null on non-D3D11/D3D12 hosts
+        // (Vulkan / OpenGL) or if backend creation failed. Declared HERE
+        // (before GpuCsvTraits) so the GPU sink's footer code can read the
+        // snapshot helpers below inline.
+        //
+        // THREADING: three thread classes touch this pointer.
+        //   * The frame thread (xrEndFrame, xrCreateSession, xrDestroySession,
+        //     ApplyToggle on the frame thread). All accesses on this thread
+        //     are serialised by the OpenXR spec's per-session "one thread at
+        //     a time" contract.
+        //   * The GPU CSV writer thread (CsvSink<gpu::GpuRow>::Run). Reads
+        //     g_gpuTimer via SnapshotBackendName() / SnapshotDroppedFrames()
+        //     to fill the "# gpu_clock=" header line and the
+        //     "# session_end gpu_ring_overflow=" footer line.
+        //   * Test / future threads: do not access.
+        //
+        // The race the mutex below closes: xrDestroySession can call
+        // g_gpuTimer.reset() while the writer thread is mid-WriteHeader or
+        // mid-WriteFooter on the GPU sink. Without serialisation, the writer
+        // would dispatch BackendName() / DroppedFrames() through a freed
+        // vtable on a host that destroys its session without first toggling
+        // Ctrl+F9 off (Unity XR Toolkit lifecycle reset, headset reconfigure,
+        // etc.). All writer-thread reads go through the snapshot helpers
+        // below; all frame-thread writes (the two reset() calls + the
+        // assignment) take the lock too. Frame-thread READS
+        // (RecordTimestamp, PollResolved, Reset) do NOT take the lock --
+        // they're already serialised against the create/destroy sites by
+        // virtue of running on the same thread.
         //
         // SAME SINGLE-SESSION ASSUMPTION AS THE SPSC RING ABOVE: an app that
         // holds two XrSession handles open concurrently on the same DLL would
-        // see them share this timer. The OpenXR spec allows this in theory,
-        // but every shipping host we know of -- including OpenComposite's
-        // probe-then-real pattern -- destroys the previous session before
-        // creating the next, which IS the case xrCreateSession's `reset()`
-        // below handles. A truly concurrent-session host would have to either
-        // refuse the second session or upgrade this to a per-session map.
+        // see them share this timer. Every shipping host we know of --
+        // including OpenComposite's probe-then-real pattern -- destroys the
+        // previous session before creating the next, which IS the case
+        // xrCreateSession's reset() below handles. A truly concurrent-
+        // session host would have to either refuse the second session or
+        // upgrade this to a per-session map.
+        std::mutex g_gpuTimerMutex;
         std::unique_ptr<gpu::IGpuTimer> g_gpuTimer;
+
+        // Writer-thread accessors. Const char* return is safe because every
+        // backend's BackendName() returns a static string literal; uint64_t
+        // is copied out under the lock. Callers MUST NOT cache the returned
+        // pointer beyond the immediate header-write line.
+        const char* SnapshotBackendName() {
+            std::lock_guard<std::mutex> lock(g_gpuTimerMutex);
+            return g_gpuTimer ? g_gpuTimer->BackendName() : "unknown";
+        }
+        uint64_t SnapshotGpuDroppedFrames() {
+            std::lock_guard<std::mutex> lock(g_gpuTimerMutex);
+            return g_gpuTimer ? g_gpuTimer->DroppedFrames() : 0;
+        }
 
         struct GpuCsvTraits {
             static constexpr const char* kFilePrefix = "gpu";
@@ -715,14 +750,12 @@ namespace openxr_api_layer {
                 // file-level header.
                 //
                 // The "gpu_clock" line carries the backend name pulled from
-                // g_gpuTimer at write time. The writer thread only reaches
-                // this code after at least one PollResolved emitted a row,
-                // which implies g_gpuTimer was non-null and remains so for
-                // the rest of the session (xrDestroySession runs on the
-                // frame thread and cannot race xrEndFrame).
-                const char* backend =
-                    g_gpuTimer ? g_gpuTimer->BackendName() : "unknown";
-                s << "# gpu_clock=" << backend << "\n"
+                // the writer-thread-safe snapshot helper above. By the time
+                // the writer reaches WriteHeader the sink has at least one
+                // row to flush, so g_gpuTimer was non-null when that row
+                // was queued; the lock prevents a concurrent
+                // xrDestroySession from racing in between.
+                s << "# gpu_clock=" << SnapshotBackendName() << "\n"
                   << "# side=" << kSideStr << "\n"
                   << "# layer=" << LayerName << "\n"
                   << "# fn=xrEndFrame\n"
@@ -737,20 +770,17 @@ namespace openxr_api_layer {
             // s of disk stall at 90 Hz to fill), AND the GPU TIMER's own
             // ring-overwrite count (g_gpuTimer->DroppedFrames(), bumped when
             // GPU readback is >kGpuRingSize frames behind, i.e. a >~44 ms
-            // GPU stall). Read here on the writer thread; the writer-thread
-            // join inside CsvSink::Stop() pairs with the render-thread
-            // relaxed fetch_add to publish the final value.
-            static uint64_t GpuRingOverflow() {
-                return g_gpuTimer ? g_gpuTimer->DroppedFrames() : 0;
-            }
+            // GPU stall). Read here on the writer thread through the
+            // snapshot helper so a concurrent xrDestroySession cannot
+            // free the timer between our null-check and the method call.
             static bool HasFooter(uint64_t droppedQueueFull) {
-                return droppedQueueFull > 0 || GpuRingOverflow() > 0;
+                return droppedQueueFull > 0 || SnapshotGpuDroppedFrames() > 0;
             }
             static void WriteFooter(std::ostream& s, uint64_t droppedQueueFull) {
                 if (droppedQueueFull > 0) {
                     s << "# session_end dropped_queue_full=" << droppedQueueFull << "\n";
                 }
-                const uint64_t overwritten = GpuRingOverflow();
+                const uint64_t overwritten = SnapshotGpuDroppedFrames();
                 if (overwritten > 0) {
                     s << "# session_end gpu_ring_overflow=" << overwritten << "\n";
                 }
@@ -1037,8 +1067,12 @@ namespace openxr_api_layer {
                 // Drop any GPU slots still in flight from a PREVIOUS session:
                 // they were tagged with that session's frame_idx numbering and
                 // would otherwise resolve into the just-truncated GPU CSV under
-                // the new session's frame 0..N. Pure CPU bookkeeping, safe on
-                // the frame thread. Null on non-D3D11 hosts.
+                // the new session's frame 0..N. Also resets the per-session
+                // drop counter so the new session's footer reports only its
+                // own overflow count. Safe on the frame thread (no other
+                // thread touches the timer's ring / counter; D3D11 path is
+                // pure CPU bookkeeping, D3D12 does a bounded fence drain).
+                // Null on Vulkan / OpenGL hosts where no timer was created.
                 if (g_gpuTimer) {
                     g_gpuTimer->Reset();
                 }
@@ -1229,32 +1263,66 @@ namespace openxr_api_layer {
                               "xrCreateSession",
                               TLArg(kSideStr, "Side"));
 
-            // Drop any timer from a prior session of this instance before
-            // building the new one (multi-session hosts: OpenComposite does a
-            // probe session then the real one). Releasing first keeps at most
-            // one timer's query objects alive at a time.
-            g_gpuTimer.reset();
+            // Walk the chain BEFORE taking the mutex so the search itself
+            // (cheap pointer chasing) doesn't block the GPU CSV writer.
+            // Holding the lock across both bindings being searched, then
+            // the previous timer's destructor (which may wait up to a few
+            // hundred ms on a fence), then the new MakeD3D* init (also
+            // possibly slow) is acceptable: the only concurrent reader is
+            // the GPU CSV writer footer/header path, and that path runs at
+            // most twice per Ctrl+F9 cycle.
+            const auto* d3d11 = FindD3D11Binding(createInfo->next);
+            const auto* d3d12 = FindD3D12Binding(createInfo->next);
+            if (d3d11 && d3d12) {
+                // Non-conformant but observed in middleware (D3D11On12-style
+                // wrappers, OpenComposite translators). The OpenXR runtime
+                // picks one; we have no way to know which, so we prefer
+                // D3D11 and warn loudly so a user seeing weird target_gpu_us
+                // numbers can match it to this log line.
+                Log("WARNING: xrCreateSession.next provides BOTH "
+                    "XrGraphicsBindingD3D11KHR and XrGraphicsBindingD3D12KHR. "
+                    "This is non-conformant; the OpenXR runtime will pick "
+                    "one for actual rendering, but we cannot tell which. "
+                    "Preferring D3D11 for the GPU timer -- if target_gpu_us "
+                    "looks like uncorrelated noise, the runtime probably "
+                    "chose D3D12 and our timestamps are landing on an idle "
+                    "context.\n");
+            }
 
-            if (const auto* d3d11 = FindD3D11Binding(createInfo->next)) {
-                g_gpuTimer = gpu::MakeD3D11GpuTimer(d3d11->device);
-                if (g_gpuTimer) {
-                    Log(fmt::format(
-                        "GPU timer active (D3D11) on side='{}'\n", kSideStr));
-                } else {
-                    Log("D3D11 binding present but GPU query creation failed; "
-                        "target_gpu_us will be blank for this session\n");
-                }
-            } else if (const auto* d3d12 = FindD3D12Binding(createInfo->next)) {
-                g_gpuTimer = gpu::MakeD3D12GpuTimer(d3d12->device, d3d12->queue);
-                if (g_gpuTimer) {
-                    Log(fmt::format(
-                        "GPU timer active (D3D12) on side='{}'\n", kSideStr));
-                } else {
-                    Log("D3D12 binding present but GPU query heap / fence / "
-                        "command-list creation failed (or the queue is not a "
-                        "DIRECT queue); target_gpu_us will be blank for this "
-                        "session\n");
-                }
+            // Drop any timer from a prior session of this instance before
+            // building the new one (multi-session hosts: OpenComposite does
+            // a probe session then the real one). Lock guards against a
+            // concurrent GPU CSV writer dereferencing the dying timer.
+            {
+                std::lock_guard<std::mutex> lock(g_gpuTimerMutex);
+                g_gpuTimer.reset();
+            }
+
+            std::unique_ptr<gpu::IGpuTimer> built;
+            const char* backend_log = nullptr;
+            const char* fail_log = nullptr;
+            if (d3d11) {
+                built = gpu::MakeD3D11GpuTimer(d3d11->device);
+                backend_log = "D3D11";
+                fail_log = "D3D11 binding present but GPU query creation "
+                           "failed; target_gpu_us will be blank for this "
+                           "session\n";
+            } else if (d3d12) {
+                built = gpu::MakeD3D12GpuTimer(d3d12->device, d3d12->queue);
+                backend_log = "D3D12";
+                fail_log = "D3D12 binding present but GPU query heap / fence "
+                           "/ command-list creation failed (or the queue is "
+                           "not a DIRECT queue); target_gpu_us will be blank "
+                           "for this session\n";
+            }
+            if (built) {
+                std::lock_guard<std::mutex> lock(g_gpuTimerMutex);
+                g_gpuTimer = std::move(built);
+                Log(fmt::format(
+                    "GPU timer active ({}) on side='{}'\n",
+                    backend_log, kSideStr));
+            } else if (fail_log) {
+                Log(fail_log);
             } else {
                 Log("No D3D11 or D3D12 binding in xrCreateSession (Vulkan / "
                     "OpenGL host); GPU monitoring off, CPU monitoring active\n");
@@ -1275,7 +1343,17 @@ namespace openxr_api_layer {
             TraceLoggingWrite(g_traceProvider,
                               "xrDestroySession",
                               TLArg(kSideStr, "Side"));
-            g_gpuTimer.reset();
+            // Lock against the GPU CSV writer thread reading g_gpuTimer for
+            // the "# gpu_clock=" header or the "# session_end gpu_ring_
+            // overflow=" footer line. Without the lock, an app that destroys
+            // the session without first toggling Ctrl+F9 off (Unity XR
+            // Toolkit lifecycle reset, headset reconfigure, scene restart)
+            // races the writer thread directly: the writer could dispatch
+            // a virtual call through a freed vtable.
+            {
+                std::lock_guard<std::mutex> lock(g_gpuTimerMutex);
+                g_gpuTimer.reset();
+            }
             return OpenXrApi::xrDestroySession(session);
         }
 
@@ -1340,13 +1418,18 @@ namespace openxr_api_layer {
                 }
 
                 // frame_idx + GPU marker BEFORE the narrow bracket. The GPU
-                // RecordTimestamp issues three immediate-context calls; those
-                // are pre's OWN overhead and must stay OUTSIDE the bracket (in
-                // it they would inflate pre.bracket and hence target_us).
-                // T_pre marks the command stream as the last GPU event before
-                // the target's draws. frame_idx is fetched here so the GPU row
-                // and the CPU row below share the same index (the merge joins
-                // GPU pre<->post and GPU<->CPU on frame_idx).
+                // RecordTimestamp's cost is backend-dependent (a few D3D11
+                // immediate-context Begin/End calls, ~100 ns; or a D3D12
+                // command-list Reset + EndQuery + ResolveQueryData + Close
+                // + ExecuteCommandLists + Signal, ~5-15 us as a syscall
+                // sequence) -- either way that work is pre's OWN overhead
+                // and MUST stay OUTSIDE the bracket. Inside it would inflate
+                // pre.bracket and bias target_us by the GPU-instrumentation
+                // cost. T_pre marks the command stream as the last GPU
+                // event before the target's draws. frame_idx is fetched
+                // here so the GPU row and the CPU row below share the same
+                // index (the merge joins GPU pre<->post and GPU<->CPU on
+                // frame_idx).
                 const uint64_t frame_idx =
                     g_frameCounter.fetch_add(1, std::memory_order_relaxed);
                 const uint32_t thread_id = GetCurrentThreadId();
