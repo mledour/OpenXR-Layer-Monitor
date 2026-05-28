@@ -37,6 +37,24 @@ def write_raw_csv(path: Path, side: str, qpc_freq: int,
             fh.write(f"{fi},{tid},{qe},{qx}\n")
 
 
+def write_gpu_csv(path: Path, side: str,
+                  rows: list[tuple[int, int, int, int]]) -> None:
+    """Mirror layer.cpp's GpuCsvSink output format.
+
+    Rows: (frame_idx, gpu_ticks, gpu_freq, valid). No file-level frequency
+    header -- gpu_freq lives in the per-row column (each disjoint query
+    reports its own clock rate at submission time).
+    """
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write("# gpu_clock=d3d11\n")
+        fh.write(f"# side={side}\n")
+        fh.write(f"# layer=XR_APILAYER_MLEDOUR_layer_monitor_{side}\n")
+        fh.write("# fn=xrEndFrame\n")
+        fh.write("frame_idx,gpu_ticks,gpu_freq,valid\n")
+        for fi, ticks, freq, valid in rows:
+            fh.write(f"{fi},{ticks},{freq},{valid}\n")
+
+
 def run_analyze(pre: Path, post: Path, out: Path | None = None,
                 cwd: Path | None = None) -> tuple[int, str, str]:
     """Run analyze.py as a subprocess. Returns (returncode, stdout, stderr).
@@ -167,6 +185,13 @@ def test_end_to_end_matches_test_merge_cpp_fixture(tmp_path: Path) -> None:
     assert "# target_pct_mean=0.5105%\n" in text
     assert "# target_pct_min=0.3604%\n" in text
     assert "# target_pct_max=0.7207%\n" in text
+    # No GPU CSVs were written by this test, so the GPU stat block is all
+    # zeros and gpu_frame_count is 0. The 4 lines must still appear so the
+    # merged-CSV schema stays uniform across D3D11 / non-D3D11 sessions.
+    assert "# target_gpu_frame_count=0\n" in text
+    assert "# target_gpu_ms_mean=0.0000\n" in text
+    assert "# target_gpu_ms_min=0.0000\n" in text
+    assert "# target_gpu_ms_max=0.0000\n" in text
 
     # The matched-frames stdout line is the user-facing confirmation.
     assert "matched frames: 4" in stdout
@@ -296,3 +321,244 @@ def test_qpc_freq_mismatch_warns_but_succeeds(tmp_path: Path) -> None:
     rc, _, stderr = run_analyze(pre, post)
     assert rc == 0
     assert "qpc_freq mismatch" in stderr.lower()
+
+
+# ----------------------------------------------------------------------------
+# GPU join (D3D11 sandwich)
+# ----------------------------------------------------------------------------
+
+
+def _data_rows(text: str) -> list[list[str]]:
+    """Return only the data rows of a merged CSV (skip # lines + column header)."""
+    return [
+        line.split(",")
+        for line in text.splitlines()
+        if line and not line.startswith("#") and not line.startswith("frame_idx")
+    ]
+
+
+def test_gpu_join_populates_target_gpu_us_when_files_present(tmp_path: Path) -> None:
+    """Drop sibling gpu-<pid>-{pre,post}.csv files and verify the join fills
+    target_gpu_us on every frame whose GPU sample is valid on both sides,
+    that the gpu_frame_count + ms stats land at the documented .4f rounding,
+    and that the column header carries the new target_gpu_us suffix."""
+    pid = "9001"
+    pre = tmp_path / f"frames-{pid}-pre.csv"
+    post = tmp_path / f"frames-{pid}-post.csv"
+    write_raw_csv(pre, "pre", 1_000_000, [
+        (0, 100, 1000, 2000),  # pre_us = 1000
+        (1, 100, 2000, 3000),  # pre_us = 1000
+    ])
+    write_raw_csv(post, "post", 1_000_000, [
+        (0, 100, 1200, 1700),  # post_us = 500 -> target = 500
+        (1, 100, 2200, 2600),  # post_us = 400 -> target = 600
+    ])
+    # 1 GHz GPU clock so a 1 us delta = 1000 ticks.
+    write_gpu_csv(tmp_path / f"gpu-{pid}-pre.csv", "pre", [
+        (0, 10_000, 1_000_000_000, 1),
+        (1, 20_000, 1_000_000_000, 1),
+    ])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-post.csv", "post", [
+        (0, 15_000, 1_000_000_000, 1),  # delta 5000 ticks = 5 us
+        (1, 28_000, 1_000_000_000, 1),  # delta 8000 ticks = 8 us
+    ])
+
+    rc, _, _ = run_analyze(pre, post)
+    assert rc == 0
+    text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
+
+    # Column header gained the target_gpu_us column.
+    assert "frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us," \
+           "target_pct_of_frame,target_gpu_us\n" in text
+
+    # GPU stats over the two valid samples (5 us + 8 us = 13 us; mean 6.5 us
+    # = 0.0065 ms). Both extremes hit gpu_ms_min / gpu_ms_max.
+    assert "# target_gpu_frame_count=2\n" in text
+    assert "# target_gpu_ms_mean=0.0065\n" in text
+    assert "# target_gpu_ms_min=0.0050\n" in text
+    assert "# target_gpu_ms_max=0.0080\n" in text
+
+    rows = _data_rows(text)
+    assert len(rows) == 2
+    # target_gpu_us is the LAST column (index 7).
+    assert rows[0][7] == "5.000"
+    assert rows[1][7] == "8.000"
+
+
+def test_gpu_absent_emits_zero_stats_and_blank_column(tmp_path: Path) -> None:
+    """No GPU CSVs at all (non-D3D11 host). The 4 GPU header lines must
+    still appear so the schema is uniform, but they all read zero and every
+    target_gpu_us cell is blank."""
+    pid = "9002"
+    pre = tmp_path / f"frames-{pid}-pre.csv"
+    post = tmp_path / f"frames-{pid}-post.csv"
+    write_raw_csv(pre, "pre", 1_000_000, [(0, 1, 1000, 2000)])
+    write_raw_csv(post, "post", 1_000_000, [(0, 1, 1200, 1700)])
+
+    rc, _, _ = run_analyze(pre, post)
+    assert rc == 0
+    text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
+
+    assert "# target_gpu_frame_count=0\n" in text
+    assert "# target_gpu_ms_mean=0.0000\n" in text
+    assert "# target_gpu_ms_min=0.0000\n" in text
+    assert "# target_gpu_ms_max=0.0000\n" in text
+
+    rows = _data_rows(text)
+    assert len(rows) == 1
+    # The CSV row keeps the trailing comma + empty cell so the column count
+    # is uniform on every row.
+    assert rows[0][7] == ""
+
+
+def test_gpu_invalid_row_blanks_target_gpu_us(tmp_path: Path) -> None:
+    """A valid=0 row on EITHER side (disjoint clock) blanks that frame."""
+    pid = "9003"
+    pre = tmp_path / f"frames-{pid}-pre.csv"
+    post = tmp_path / f"frames-{pid}-post.csv"
+    write_raw_csv(pre, "pre", 1_000_000, [(0, 1, 1000, 2000), (1, 1, 2000, 3000)])
+    write_raw_csv(post, "post", 1_000_000, [(0, 1, 1200, 1700), (1, 1, 2200, 2600)])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-pre.csv", "pre", [
+        (0, 10_000, 1_000_000_000, 1),
+        (1, 20_000, 1_000_000_000, 0),  # pre invalid -> frame 1 blank
+    ])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-post.csv", "post", [
+        (0, 15_000, 1_000_000_000, 1),
+        (1, 28_000, 1_000_000_000, 1),  # post valid alone is not enough
+    ])
+
+    rc, _, _ = run_analyze(pre, post)
+    assert rc == 0
+    text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
+    rows = _data_rows(text)
+    assert len(rows) == 2
+    assert rows[0][7] == "5.000"
+    assert rows[1][7] == ""
+    # Only one valid GPU sample feeds the aggregates.
+    assert "# target_gpu_frame_count=1\n" in text
+
+
+def test_gpu_freq_mismatch_blanks_target_gpu_us(tmp_path: Path) -> None:
+    """Different gpu_freq between the two sides means the GPU clock was
+    disjoint across the measured span -- we can't trust the delta."""
+    pid = "9004"
+    pre = tmp_path / f"frames-{pid}-pre.csv"
+    post = tmp_path / f"frames-{pid}-post.csv"
+    write_raw_csv(pre, "pre", 1_000_000, [(0, 1, 1000, 2000)])
+    write_raw_csv(post, "post", 1_000_000, [(0, 1, 1200, 1700)])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-pre.csv", "pre", [
+        (0, 10_000, 1_000_000_000, 1),
+    ])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-post.csv", "post", [
+        (0, 15_000, 2_000_000_000, 1),  # different freq -> blank
+    ])
+
+    rc, _, _ = run_analyze(pre, post)
+    assert rc == 0
+    text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
+    rows = _data_rows(text)
+    assert rows[0][7] == ""
+    assert "# target_gpu_frame_count=0\n" in text
+
+
+def test_gpu_backwards_counter_blanks_target_gpu_us(tmp_path: Path) -> None:
+    """post.gpu_ticks < pre.gpu_ticks is a driver bug -- treating the
+    unsigned wrap as a huge delta would poison stats. We blank it."""
+    pid = "9005"
+    pre = tmp_path / f"frames-{pid}-pre.csv"
+    post = tmp_path / f"frames-{pid}-post.csv"
+    write_raw_csv(pre, "pre", 1_000_000, [(0, 1, 1000, 2000)])
+    write_raw_csv(post, "post", 1_000_000, [(0, 1, 1200, 1700)])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-pre.csv", "pre", [
+        (0, 20_000, 1_000_000_000, 1),
+    ])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-post.csv", "post", [
+        (0, 10_000, 1_000_000_000, 1),  # less than pre -> blank
+    ])
+
+    rc, _, _ = run_analyze(pre, post)
+    assert rc == 0
+    text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
+    rows = _data_rows(text)
+    assert rows[0][7] == ""
+
+
+def test_gpu_malformed_header_warns_and_continues_cpu_only(tmp_path: Path) -> None:
+    """A garbled GPU column header MUST NOT abort the CPU merge -- the C++
+    behaviour is to log + skip. analyze.py matches: warns on stderr,
+    returns 0, leaves target_gpu_us blank."""
+    pid = "9006"
+    pre = tmp_path / f"frames-{pid}-pre.csv"
+    post = tmp_path / f"frames-{pid}-post.csv"
+    write_raw_csv(pre, "pre", 1_000_000, [(0, 1, 1000, 2000)])
+    write_raw_csv(post, "post", 1_000_000, [(0, 1, 1200, 1700)])
+    # Hand-write a garbled GPU pre with a wrong column header so
+    # load_gpu returns None instead of raising.
+    bad = tmp_path / f"gpu-{pid}-pre.csv"
+    with bad.open("w", encoding="utf-8") as fh:
+        fh.write("# gpu_clock=d3d11\n")
+        fh.write("# side=pre\n")
+        fh.write("wrong,column,header,line\n")
+        fh.write("0,10000,1000000000,1\n")
+    write_gpu_csv(tmp_path / f"gpu-{pid}-post.csv", "post", [
+        (0, 15_000, 1_000_000_000, 1),
+    ])
+
+    rc, _, stderr = run_analyze(pre, post)
+    assert rc == 0
+    assert "unexpected gpu column header" in stderr.lower()
+    text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
+    rows = _data_rows(text)
+    # CPU merge proceeded; GPU column is blank because the pre side was
+    # skipped. frame_interval_us is blank too because this is the only frame
+    # on its thread (no successor -> no interval).
+    assert rows[0][:6] == ["0", "1", "", "1000.000", "500.000", "500.000"]
+    assert rows[0][7] == ""
+    assert "# target_gpu_frame_count=0\n" in text
+
+
+def test_gpu_only_one_side_present_blanks_target_gpu_us(tmp_path: Path) -> None:
+    """A frame that has a GPU row on only one side cannot be joined.
+    Verifies the join skips it (rather than crashing with KeyError)."""
+    pid = "9007"
+    pre = tmp_path / f"frames-{pid}-pre.csv"
+    post = tmp_path / f"frames-{pid}-post.csv"
+    write_raw_csv(pre, "pre", 1_000_000, [(0, 1, 1000, 2000), (1, 1, 2000, 3000)])
+    write_raw_csv(post, "post", 1_000_000, [(0, 1, 1200, 1700), (1, 1, 2200, 2600)])
+    # Only the pre side has a GPU row for frame 1; the post side has no row.
+    # Symmetrically, frame 0 has only a post GPU row, no pre.
+    write_gpu_csv(tmp_path / f"gpu-{pid}-pre.csv", "pre", [
+        (1, 20_000, 1_000_000_000, 1),
+    ])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-post.csv", "post", [
+        (0, 15_000, 1_000_000_000, 1),
+    ])
+
+    rc, _, _ = run_analyze(pre, post)
+    assert rc == 0
+    text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
+    rows = _data_rows(text)
+    assert rows[0][7] == ""
+    assert rows[1][7] == ""
+    assert "# target_gpu_frame_count=0\n" in text
+
+
+def test_gpu_lf_only_line_endings(tmp_path: Path) -> None:
+    """The full merged CSV (with GPU column populated) must remain LF-only,
+    same byte-equivalence contract as the CPU-only case."""
+    pid = "9008"
+    pre = tmp_path / f"frames-{pid}-pre.csv"
+    post = tmp_path / f"frames-{pid}-post.csv"
+    write_raw_csv(pre, "pre", 1_000_000, [(0, 1, 1000, 2000)])
+    write_raw_csv(post, "post", 1_000_000, [(0, 1, 1200, 1700)])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-pre.csv", "pre", [
+        (0, 10_000, 1_000_000_000, 1),
+    ])
+    write_gpu_csv(tmp_path / f"gpu-{pid}-post.csv", "post", [
+        (0, 15_000, 1_000_000_000, 1),
+    ])
+
+    rc, _, _ = run_analyze(pre, post)
+    assert rc == 0
+    raw = (tmp_path / f"frames-merged-{pid}.csv").read_bytes()
+    assert b"\r" not in raw, "merged CSV with GPU column must remain LF-only"

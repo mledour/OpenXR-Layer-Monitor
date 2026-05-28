@@ -1,9 +1,10 @@
 # OpenXR-Layer-Monitor
 
-Measure the per-frame CPU cost an OpenXR API layer adds to your application,
-without modifying the target layer. You install two tiny layers around the
-one you want to profile, run your app, and get a CSV that tells you how
-many microseconds the target layer burned on the frame thread, per frame.
+Measure the per-frame CPU **and GPU** cost an OpenXR API layer adds to your
+application, without modifying the target layer. You install two tiny layers
+around the one you want to profile, run your app, and get a CSV that tells
+you how many microseconds the target layer burned on the frame thread (and
+on the GPU command stream) per frame.
 
 ```
 app -> ..._pre -> <target layer> -> ..._post -> runtime
@@ -26,27 +27,46 @@ SPSC ring `Push` + function return that live after `qpc_exit_post`).
 For target layers in the µs-to-ms range this is well below the QPC
 noise floor; even a sub-µs target layer is mostly faithfully measured.
 
+For **GPU cost** the same idea applies, but the endpoints are single GPU
+timestamps in the command stream rather than a pair on each side. Pre
+inserts a D3D11 timestamp just before forwarding to the target; post
+inserts one at the very start of its `xrEndFrame` (i.e. right after the
+target finished submitting). The merge subtracts:
+
+```
+target_gpu_us = (post_gpu_ticks - pre_gpu_ticks) / gpu_freq * 1e6
+```
+
+This is read back asynchronously a few frames later via D3D11 timestamp
+queries with `D3D11_ASYNC_GETDATA_DONOTFLUSH`. D3D12 and Vulkan are not
+yet wired up; on those hosts the GPU column stays blank, the CPU sandwich
+keeps working.
+
 ## What you can do with it
 
 - Compare two versions of the same layer after an optimization
-  ("did my change actually reduce CPU?").
-- Spot frame spikes (p95 / p99 / max) instead of just averages.
-- Sanity-check that a third-party layer isn't burning more CPU than it claims.
-- Establish a baseline before writing your own layer.
+  ("did my change actually reduce CPU/GPU?").
+- Spot frame spikes (p95 / p99 / max) instead of just averages, on
+  either timeline.
+- Sanity-check that a third-party layer isn't burning more CPU or GPU
+  than it claims.
+- Establish a CPU+GPU baseline before writing your own layer.
 
-The tool produces a CSV per process and ETW events. A small Python script
-merges the two halves into a single `target_us` column.
+The tool produces CPU + GPU CSVs per process and ETW events. A small
+Python script merges the four halves into a single row per frame with
+both `target_us` and `target_gpu_us` columns.
 
 ## Status
 
 | Capability                       | Status |
 | -------------------------------- | ------ |
 | CPU sandwich on `xrEndFrame`     | yes |
+| GPU sandwich on `xrEndFrame` (D3D11) | yes |
+| GPU sandwich (D3D12 / Vulkan)    | not yet |
 | Other per-frame functions        | not yet (planned: `xrWaitFrame`, `xrBeginFrame`, `xrLocateViews`) |
-| GPU timestamps (D3D11 / D3D12)   | not yet |
 | ETW emission                     | yes (`TraceLoggingWrite`, capture with `scripts\Tracing.wprp`) |
-| CSV per process                  | yes |
-| Python analyzer                  | yes |
+| CSV per process                  | yes (CPU + GPU, separate files merged on Ctrl+F9 stop) |
+| Python analyzer                  | yes (joins GPU automatically when sibling `gpu-*.csv` files exist) |
 
 Built on [`mbucchia/OpenXR-Layer-Template`](https://github.com/mbucchia/OpenXR-Layer-Template).
 
@@ -182,8 +202,8 @@ or remove the two HKLM values manually.
    %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\frames-merged-<pid>.csv
    ```
 
-   The top seven lines are a session-wide summary (also greppable from
-   the shell):
+   The top **eleven** lines are a session-wide summary (also greppable
+   from the shell):
 
    ```
    # frame_count=1842
@@ -193,6 +213,10 @@ or remove the two HKLM values manually.
    # target_pct_mean=0.1110%
    # target_pct_min=0.0030%
    # target_pct_max=3.0780%
+   # target_gpu_frame_count=1839
+   # target_gpu_ms_mean=0.0840
+   # target_gpu_ms_min=0.0210
+   # target_gpu_ms_max=2.1500
    ```
 
    `frame_count` is the number of matched frames between pre and post.
@@ -202,6 +226,14 @@ or remove the two HKLM values manually.
    useful for spotting bursty or sparse layers where the mean dilutes
    the actual per-call cost. `target_pct_*` aggregates only over frames
    that have a successor (every frame except the last per thread).
+
+   The four `target_gpu_*` lines aggregate the GPU sandwich. The
+   `frame_count` for the GPU block is independent of the CPU one: it
+   only counts frames whose D3D11 timestamp resolved successfully on
+   BOTH sides (no disjoint clock, matching frequency, monotonic delta).
+   On a non-D3D11 host the four lines are still present with zero
+   counts and zero ms -- the schema stays uniform so a single parser
+   handles every session.
 
    **`target_ms_min` can be negative.** `target_us = pre_us - post_us`
    and QPC jitter occasionally pushes the post-side bracket slightly
@@ -224,6 +256,7 @@ or remove the two HKLM values manually.
    | `post_us`               | post-side bracket = runtime |
    | `target_us`             | `pre_us − post_us` -- the target layer's CPU cost |
    | `target_pct_of_frame`   | `target_us / frame_interval_us * 100` (blank on the last row) |
+   | `target_gpu_us`         | `(post_gpu_ticks − pre_gpu_ticks) / gpu_freq * 1e6` (blank when no valid GPU sample on both sides, non-D3D11 host, frequency mismatch, or backwards counter) |
 
    Drop it into a spreadsheet / pandas / your plotting tool of choice.
    The `target_pct_of_frame` column answers "what slice of the host's
@@ -241,7 +274,8 @@ or remove the two HKLM values manually.
    python scripts\analyze.py "$dir\frames-<pid>-pre.csv" "$dir\frames-<pid>-post.csv"
    ```
 
-   Example output:
+   Example output (D3D11 host -- on a non-D3D11 host the `target_gpu_us`
+   block reads `(no samples)`):
 
    ```
    matched frames: 1842
@@ -264,9 +298,21 @@ or remove the two HKLM values manually.
        min       0.003
        max       3.078
 
+   target_gpu_us      (microseconds):
+       count  1839
+       mean      84.00
+       median    73.20
+       p95      198.40
+       p99      512.30
+       min       21.00
+       max     2150.00
+
    frame_interval_us median: 11100.00  (~90.1 Hz)
    wrote frames-merged.csv
    ```
+
+   `--gpu-pre` / `--gpu-post` override the sibling-discovery default if
+   you copy the CSVs to a different directory before analyzing.
 
 ### Real-time tracing (ETW)
 
@@ -304,14 +350,16 @@ per-side names so they coexist there; the per-frame CSVs carry a
 
 ```
 %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\
-    XR_APILAYER_MLEDOUR_layer_monitor_pre.log     init log (app name, runtime, QPC freq)
+    XR_APILAYER_MLEDOUR_layer_monitor_pre.log     init log (app name, runtime, QPC freq, GPU active y/n)
     XR_APILAYER_MLEDOUR_layer_monitor_post.log
-    frames-<pid>-pre.csv                           one row per xrEndFrame call (truncated on each Ctrl+F9 start)
+    frames-<pid>-pre.csv                           CPU bracket per xrEndFrame call (truncated on each Ctrl+F9 start)
     frames-<pid>-post.csv
+    gpu-<pid>-pre.csv                              GPU timestamp per xrEndFrame call -- D3D11 hosts only; absent on D3D12 / Vulkan / OpenGL
+    gpu-<pid>-post.csv
     frames-merged-<pid>.csv                        auto-written by post on Ctrl+F9 stop or xrDestroyInstance fallback
 ```
 
-CSV format (header rows start with `#`):
+CPU CSV format (header rows start with `#`):
 
 ```
 # qpc_freq=10000000
@@ -321,6 +369,22 @@ CSV format (header rows start with `#`):
 frame_idx,thread_id,qpc_entry,qpc_exit
 0,12345,17834950123456,17834950456789
 1,12345,17834951678901,17834951901234
+...
+```
+
+GPU CSV format (`gpu_freq` is per row -- D3D11 reports the clock rate
+on each disjoint query rather than once for the whole file; `valid=0`
+means the disjoint query reported Disjoint or a zero frequency at the
+moment of the timestamp):
+
+```
+# gpu_clock=d3d11
+# side=pre
+# layer=XR_APILAYER_MLEDOUR_layer_monitor_pre
+# fn=xrEndFrame
+frame_idx,gpu_ticks,gpu_freq,valid
+0,1234567890,12000000,1
+1,1234580000,12000000,1
 ...
 ```
 
@@ -344,9 +408,9 @@ also not recorded (the writer is already shut down by the time the
 record path would have appended), so the CSV row count is the number
 of frames strictly between start and stop.
 
-The merged CSV has a different schema -- seven `#` comment lines at
-the top with the session summary, then the column header, then one
-row per matched frame:
+The merged CSV has a different schema -- eleven `#` comment lines at
+the top with the session summary (seven CPU + four GPU), then the
+column header, then one row per matched frame:
 
 ```
 # frame_count=<int>
@@ -356,15 +420,23 @@ row per matched frame:
 # target_pct_mean=<float>%           percentage of frame interval
 # target_pct_min=<float>%            percentage of frame interval
 # target_pct_max=<float>%            percentage of frame interval
-frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,target_pct_of_frame
-<int>,<int>,<float>,<float>,<float>,<float>,<float>
+# target_gpu_frame_count=<int>       frames with a valid GPU sample on both sides
+# target_gpu_ms_mean=<float>         ms (over the gpu_frame_count subset only)
+# target_gpu_ms_min=<float>          ms
+# target_gpu_ms_max=<float>          ms
+frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,target_pct_of_frame,target_gpu_us
+<int>,<int>,<float>,<float>,<float>,<float>,<float>,<float>
 ...
 ```
 
 All `#`-prefixed values are bare numbers (no unit) except
 `target_pct_*` which carries a literal `%` after the value for
-visual clarity. All line endings are LF (the C++ writer opens the
-file in binary mode, the Python writer uses `lineterminator='\n'`).
+visual clarity. The four GPU stat lines are zero (and the
+`target_gpu_us` column is blank on every row) when no D3D11
+graphics binding was found in `xrCreateSession` -- the schema
+stays the same so a single parser handles every session. All line
+endings are LF (the C++ writer opens the file in binary mode, the
+Python writer uses `lineterminator='\n'`).
 
 ## How it works
 
@@ -399,10 +471,23 @@ the target layer's score.
 
 ## Limitations
 
-- **CPU only, frame thread only.** Off-thread work spawned by the target
-  layer (worker threads, fire-and-forget compute) is invisible to the
-  sandwich -- it only sees what the layer does synchronously inside its
+- **Frame thread only.** Off-thread CPU work spawned by the target layer
+  (worker threads, fire-and-forget compute) is invisible to the sandwich
+  -- it only sees what the layer does synchronously inside its
   `xrEndFrame` override.
+- **GPU sandwich is D3D11 only.** D3D12 / Vulkan / OpenGL hosts get
+  blank `target_gpu_us`; the CPU sandwich still works. The D3D11 path
+  measures only work submitted on the app's **immediate context** in
+  **command-stream order** between the two timestamps: a target that
+  renders on a deferred context, a private device, or a separate
+  queue is invisible to the GPU measurement. The per-side disjoint
+  query covers only the *instant* of each timestamp -- a GPU clock
+  change happening between `T_pre` and `T_post` may go unflagged
+  (frequency mismatch IS caught and blanks the frame; a Disjoint flag
+  on either side blanks the frame; rare). Each GPU sample is read back
+  ~3 frames late through an async readback ring, so the last few
+  frames of a session can be missing GPU rows -- the merge tolerates
+  the gap (CPU row present, GPU column blank).
 - **Layer ordering is on you.** If a fourth layer slips between pre and
   the target (or between target and post), its CPU gets billed to the
   target. Always sanity-check `reg query` after install.

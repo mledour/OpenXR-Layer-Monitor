@@ -117,6 +117,33 @@ namespace {
         return RawFrameRow{fi, tid, qe, qx};
     }
 
+    // Convenience: build a RawGpuRow from positional args. valid is uint32
+    // (0 / 1) to match the on-disk encoding the layer writes.
+    RawGpuRow GpuRow(uint64_t fi, uint64_t ticks, uint64_t freq, uint32_t valid) {
+        return RawGpuRow{fi, ticks, freq, valid};
+    }
+
+    // Write a per-side GPU CSV with the layout GpuCsvSink emits:
+    //   # gpu_clock=d3d11
+    //   # side=...
+    //   # layer=...
+    //   # fn=xrEndFrame
+    //   frame_idx,gpu_ticks,gpu_freq,valid
+    //   <rows>
+    fs::path WriteGpuCsv(const std::string& name,
+                         const std::vector<RawGpuRow>& rows) {
+        const fs::path path = TestTempDir() / name;
+        std::ofstream out(path, std::ios::out | std::ios::trunc);
+        REQUIRE(out);
+        out << "# gpu_clock=d3d11\n# side=test\n# layer=test\n# fn=xrEndFrame\n"
+            << "frame_idx,gpu_ticks,gpu_freq,valid\n";
+        for (const auto& r : rows) {
+            out << r.frame_idx << ',' << r.gpu_ticks << ','
+                << r.gpu_freq << ',' << r.valid << '\n';
+        }
+        return path;
+    }
+
 } // namespace
 
 // ============================================================================
@@ -205,15 +232,16 @@ TEST_CASE("ReadFrameCsv: empty lines and stray comments are ignored") {
 TEST_CASE("ReadFrameCsv: header_valid is false when the column header does not "
           "match the spec (e.g. merged CSV fed in by mistake)") {
     // Simulate a frames-merged-<pid>.csv fed in where the per-side CSV
-    // belongs. Its first non-comment line lists seven columns, not four.
+    // belongs. Its first non-comment line lists eight columns (since GPU
+    // monitoring was added), not the four ReadFrameCsv expects.
     const fs::path path = TestTempDir() / "rfc_merged_by_mistake.csv";
     {
         std::ofstream out(path);
         out << "# frame_count=42\n"
             << "# target_ms_mean=0.0123\n"
             << "frame_idx,thread_id,frame_interval_us,pre_us,post_us,"
-               "target_us,target_pct_of_frame\n"
-            << "0,1,11100.000,1.234,0.123,1.111,0.0100\n";
+               "target_us,target_pct_of_frame,target_gpu_us\n"
+            << "0,1,11100.000,1.234,0.123,1.111,0.0100,5.000\n";
     }
     const auto parsed = ReadFrameCsv(path, /*defaultFreq=*/10'000'000);
     CHECK_FALSE(parsed.header_valid);
@@ -512,7 +540,7 @@ TEST_CASE("ComputeStats: negative target_us counted") {
 // WriteMergedCsv
 // ============================================================================
 
-TEST_CASE("WriteMergedCsv: header has the seven # lines + column line") {
+TEST_CASE("WriteMergedCsv: header has the eleven # lines + column line") {
     std::vector<MergedRow> merged(1);
     merged[0].frame_idx = 0;
     merged[0].thread_id = 12345;
@@ -521,13 +549,16 @@ TEST_CASE("WriteMergedCsv: header has the seven # lines + column line") {
     merged[0].target_us = 50.0;
     merged[0].frame_interval_us = 11100.0;
     merged[0].target_pct_of_frame = 50.0 / 11100.0 * 100.0;
+    // No target_gpu_us on this row -- exercises the CPU-only-session path
+    // where the four GPU header lines must still appear (with zeros) so the
+    // merged-CSV schema stays uniform across D3D11 / non-D3D11 sessions.
 
     const auto stats = ComputeStats(merged);
     std::ostringstream out;
     WriteMergedCsv(out, merged, stats);
 
     const std::string s = out.str();
-    // Seven # lines + 1 column header + 1 data row + trailing \n.
+    // 7 CPU stat lines + 4 GPU stat lines + 1 column header + 1 data row.
     INFO("Full output:\n" << s);
     CHECK(s.find("# frame_count=1\n") != std::string::npos);
     CHECK(s.find("# target_ms_mean=0.0500\n") != std::string::npos);
@@ -537,8 +568,16 @@ TEST_CASE("WriteMergedCsv: header has the seven # lines + column line") {
     CHECK(s.find("# target_pct_mean=0.4505%\n") != std::string::npos);
     CHECK(s.find("# target_pct_min=0.4505%\n") != std::string::npos);
     CHECK(s.find("# target_pct_max=0.4505%\n") != std::string::npos);
+    // GPU block: no rows have target_gpu_us, so the count is 0 and the
+    // ms_* aggregates round to 0.0000. No '%' suffix on the GPU ms lines.
+    CHECK(s.find("# target_gpu_frame_count=0\n") != std::string::npos);
+    CHECK(s.find("# target_gpu_ms_mean=0.0000\n") != std::string::npos);
+    CHECK(s.find("# target_gpu_ms_min=0.0000\n") != std::string::npos);
+    CHECK(s.find("# target_gpu_ms_max=0.0000\n") != std::string::npos);
+    // Column header gained the trailing target_gpu_us column.
     CHECK(s.find("frame_idx,thread_id,frame_interval_us,pre_us,post_us,"
-                 "target_us,target_pct_of_frame\n") != std::string::npos);
+                 "target_us,target_pct_of_frame,target_gpu_us\n") !=
+          std::string::npos);
 }
 
 TEST_CASE("WriteMergedCsv: data row format matches the .3f/.4f contract") {
@@ -550,25 +589,29 @@ TEST_CASE("WriteMergedCsv: data row format matches the .3f/.4f contract") {
     merged[0].target_us = 1.111111;
     merged[0].frame_interval_us = 11111.555;
     merged[0].target_pct_of_frame = 0.01000;
+    merged[0].target_gpu_us = 12.345678;  // .3f -> "12.346"
 
-    // Last row per thread: optionals blank.
+    // Last row per thread: optionals blank, including target_gpu_us.
     merged[1].frame_idx = 1;
     merged[1].thread_id = 42;
     merged[1].pre_us = 2.000;
     merged[1].post_us = 1.000;
     merged[1].target_us = 1.000;
-    // frame_interval_us / target_pct_of_frame stay nullopt.
+    // frame_interval_us / target_pct_of_frame / target_gpu_us stay nullopt.
 
     const auto stats = ComputeStats(merged);
     std::ostringstream out;
     WriteMergedCsv(out, merged, stats);
 
     const std::string s = out.str();
-    // .3f on us values, .4f on pct.
-    CHECK(s.find("0,42,11111.555,1.235,0.123,1.111,0.0100") !=
+    // Row with all eight cells populated: .3f on the GPU column too, ending
+    // on a newline (no trailing comma at end-of-line).
+    CHECK(s.find("0,42,11111.555,1.235,0.123,1.111,0.0100,12.346\n") !=
           std::string::npos);
-    // Last row: empty frame_interval_us and empty target_pct_of_frame.
-    CHECK(s.find("1,42,,2.000,1.000,1.000,") != std::string::npos);
+    // Last row: empty frame_interval_us AND empty target_pct_of_frame AND
+    // empty target_gpu_us -- three blank cells, two trailing commas before
+    // the newline.
+    CHECK(s.find("1,42,,2.000,1.000,1.000,,\n") != std::string::npos);
 }
 
 TEST_CASE("WriteMergedCsv: output uses LF line endings on disk via a binary ofstream") {
@@ -600,6 +643,220 @@ TEST_CASE("WriteMergedCsv: output uses LF line endings on disk via a binary ofst
     // Sanity: the file should contain at least one '\n' (otherwise the
     // CHECK above would trivially pass on an empty file).
     CHECK(bytes.find('\n') != std::string::npos);
+}
+
+// ============================================================================
+// ReadGpuCsv
+// ============================================================================
+
+TEST_CASE("ReadGpuCsv: missing file returns empty rows and header_valid=true") {
+    // Missing GPU CSV is the normal case on non-D3D11 hosts. The caller
+    // proceeds CPU-only with every target_gpu_us blank -- header_valid must
+    // stay true so the caller does not mistake it for a parse error.
+    const auto path = TestTempDir() / "gpu_definitely_not_there.csv";
+    std::error_code ec;
+    fs::remove(path, ec);
+    const auto parsed = ReadGpuCsv(path);
+    CHECK(parsed.rows.empty());
+    CHECK(parsed.header_valid);
+}
+
+TEST_CASE("ReadGpuCsv: parses a well-formed GPU CSV") {
+    const auto path = WriteGpuCsv("gpu_basic.csv", {
+        GpuRow(0, 10'000, 1'000'000'000, 1),
+        GpuRow(1, 20'000, 1'000'000'000, 0),
+    });
+    const auto parsed = ReadGpuCsv(path);
+    CHECK(parsed.header_valid);
+    REQUIRE(parsed.rows.size() == 2);
+    CHECK(parsed.rows[0].frame_idx == 0);
+    CHECK(parsed.rows[0].gpu_ticks == 10'000);
+    CHECK(parsed.rows[0].gpu_freq == 1'000'000'000);
+    CHECK(parsed.rows[0].valid == 1);
+    CHECK(parsed.rows[1].valid == 0);
+}
+
+TEST_CASE("ReadGpuCsv: header_valid is false on a malformed column header") {
+    // A garbled column header must signal "skip GPU join" via header_valid
+    // = false rather than aborting -- the CPU merge has to keep running.
+    const fs::path path = TestTempDir() / "gpu_bad_header.csv";
+    {
+        std::ofstream out(path);
+        out << "# gpu_clock=d3d11\n# side=pre\n"
+            << "this_is_not_a_valid_header\n"
+            << "0,10000,1000000000,1\n";
+    }
+    const auto parsed = ReadGpuCsv(path);
+    CHECK_FALSE(parsed.header_valid);
+    CHECK(parsed.rows.empty());
+}
+
+TEST_CASE("ReadGpuCsv: CRLF on the column header still validates") {
+    const fs::path path = TestTempDir() / "gpu_crlf.csv";
+    {
+        std::ofstream out(path, std::ios::out | std::ios::binary);
+        out << "# gpu_clock=d3d11\r\n"
+            << "frame_idx,gpu_ticks,gpu_freq,valid\r\n"
+            << "0,123,456,1\r\n";
+    }
+    const auto parsed = ReadGpuCsv(path);
+    CHECK(parsed.header_valid);
+    REQUIRE(parsed.rows.size() == 1);
+    CHECK(parsed.rows[0].gpu_ticks == 123);
+}
+
+// ============================================================================
+// JoinGpu
+// ============================================================================
+
+TEST_CASE("JoinGpu: empty inputs leave every target_gpu_us blank") {
+    std::vector<MergedRow> merged(2);
+    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    merged[1].frame_idx = 1; merged[1].thread_id = 1;
+    JoinGpu(merged, {}, {});
+    CHECK_FALSE(merged[0].target_gpu_us.has_value());
+    CHECK_FALSE(merged[1].target_gpu_us.has_value());
+}
+
+TEST_CASE("JoinGpu: matched valid pair fills target_gpu_us") {
+    // 1 GHz GPU clock -> 1 tick = 1 ns -> 1000 ticks = 1 us.
+    std::vector<MergedRow> merged(1);
+    merged[0].frame_idx = 5;
+    merged[0].thread_id = 42;
+    JoinGpu(merged,
+            {GpuRow(5, 10'000, 1'000'000'000, 1)},
+            {GpuRow(5, 15'000, 1'000'000'000, 1)});
+    REQUIRE(merged[0].target_gpu_us.has_value());
+    CHECK(*merged[0].target_gpu_us == doctest::Approx(5.0));
+}
+
+TEST_CASE("JoinGpu: a valid=0 row on either side blanks the frame") {
+    // Pre invalid.
+    {
+        std::vector<MergedRow> merged(1);
+        merged[0].frame_idx = 0; merged[0].thread_id = 1;
+        JoinGpu(merged,
+                {GpuRow(0, 10'000, 1'000'000'000, 0)},
+                {GpuRow(0, 15'000, 1'000'000'000, 1)});
+        CHECK_FALSE(merged[0].target_gpu_us.has_value());
+    }
+    // Post invalid.
+    {
+        std::vector<MergedRow> merged(1);
+        merged[0].frame_idx = 0; merged[0].thread_id = 1;
+        JoinGpu(merged,
+                {GpuRow(0, 10'000, 1'000'000'000, 1)},
+                {GpuRow(0, 15'000, 1'000'000'000, 0)});
+        CHECK_FALSE(merged[0].target_gpu_us.has_value());
+    }
+}
+
+TEST_CASE("JoinGpu: gpu_freq mismatch blanks the frame") {
+    // Different reported clock rates mean the GPU clock was disjoint across
+    // the measured span -- the delta would be meaningless.
+    std::vector<MergedRow> merged(1);
+    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    JoinGpu(merged,
+            {GpuRow(0, 10'000, 1'000'000'000, 1)},
+            {GpuRow(0, 15'000, 2'000'000'000, 1)});
+    CHECK_FALSE(merged[0].target_gpu_us.has_value());
+}
+
+TEST_CASE("JoinGpu: gpu_freq == 0 blanks the frame") {
+    std::vector<MergedRow> merged(1);
+    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    JoinGpu(merged,
+            {GpuRow(0, 10'000, 0, 1)},
+            {GpuRow(0, 15'000, 0, 1)});
+    CHECK_FALSE(merged[0].target_gpu_us.has_value());
+}
+
+TEST_CASE("JoinGpu: post_ticks < pre_ticks (driver bug) blanks the frame") {
+    // Treating the unsigned wrap of (post - pre) as the delta would
+    // produce a huge bogus value. The join must refuse it.
+    std::vector<MergedRow> merged(1);
+    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    JoinGpu(merged,
+            {GpuRow(0, 20'000, 1'000'000'000, 1)},
+            {GpuRow(0, 10'000, 1'000'000'000, 1)});
+    CHECK_FALSE(merged[0].target_gpu_us.has_value());
+}
+
+TEST_CASE("JoinGpu: a frame missing on one GPU side stays blank") {
+    std::vector<MergedRow> merged(2);
+    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    merged[1].frame_idx = 1; merged[1].thread_id = 1;
+    JoinGpu(merged,
+            {GpuRow(0, 10'000, 1'000'000'000, 1)},    // only frame 0 pre
+            {GpuRow(1, 15'000, 1'000'000'000, 1)});   // only frame 1 post
+    CHECK_FALSE(merged[0].target_gpu_us.has_value());
+    CHECK_FALSE(merged[1].target_gpu_us.has_value());
+}
+
+TEST_CASE("JoinGpu: ignores GPU rows that don't match any CPU merged row") {
+    // GPU rows for frames the CPU side never saw must NOT crash or invent
+    // rows -- they are simply ignored.
+    std::vector<MergedRow> merged(1);
+    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    JoinGpu(merged,
+            {GpuRow(0, 10'000, 1'000'000'000, 1),
+             GpuRow(999, 99'000, 1'000'000'000, 1)},
+            {GpuRow(0, 15'000, 1'000'000'000, 1),
+             GpuRow(999, 99'500, 1'000'000'000, 1)});
+    REQUIRE(merged[0].target_gpu_us.has_value());
+    CHECK(*merged[0].target_gpu_us == doctest::Approx(5.0));
+    CHECK(merged.size() == 1);  // no new rows invented
+}
+
+TEST_CASE("JoinGpu: duplicate frame_idx in input resolves last-wins") {
+    // Matches std::map[key] = row on the C++ side and analyze.py's dict
+    // comprehension. The contract is "later rows overwrite", not "first
+    // wins".
+    std::vector<MergedRow> merged(1);
+    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    JoinGpu(merged,
+            {GpuRow(0, 10'000, 1'000'000'000, 1),
+             GpuRow(0, 12'000, 1'000'000'000, 1)},   // last-wins: 12000
+            {GpuRow(0, 15'000, 1'000'000'000, 1)});
+    REQUIRE(merged[0].target_gpu_us.has_value());
+    // delta = 15000 - 12000 = 3000 ticks / 1 GHz = 3 us.
+    CHECK(*merged[0].target_gpu_us == doctest::Approx(3.0));
+}
+
+// ============================================================================
+// ComputeStats GPU aggregates
+// ============================================================================
+
+TEST_CASE("ComputeStats: gpu aggregates over rows with target_gpu_us only") {
+    std::vector<MergedRow> merged(3);
+    // Three frames; first two have GPU samples, third doesn't.
+    for (size_t i = 0; i < merged.size(); ++i) {
+        merged[i].frame_idx = static_cast<uint64_t>(i);
+        merged[i].thread_id = 1;
+        merged[i].pre_us = 100.0;
+        merged[i].post_us = 50.0;
+        merged[i].target_us = 50.0;
+    }
+    merged[0].target_gpu_us = 5'000.0;   // 5.0 ms
+    merged[1].target_gpu_us = 8'000.0;   // 8.0 ms
+    // merged[2].target_gpu_us stays nullopt -- excluded from GPU stats.
+
+    const auto stats = ComputeStats(merged);
+    CHECK(stats.gpu_frame_count == 2);
+    CHECK(stats.target_gpu_ms_mean == doctest::Approx((5.0 + 8.0) / 2.0));
+    CHECK(stats.target_gpu_ms_min == doctest::Approx(5.0));
+    CHECK(stats.target_gpu_ms_max == doctest::Approx(8.0));
+}
+
+TEST_CASE("ComputeStats: gpu aggregates are zero when no row has target_gpu_us") {
+    std::vector<MergedRow> merged(2);
+    merged[0].target_us = 50.0;
+    merged[1].target_us = 40.0;
+    const auto stats = ComputeStats(merged);
+    CHECK(stats.gpu_frame_count == 0);
+    CHECK(stats.target_gpu_ms_mean == 0.0);
+    CHECK(stats.target_gpu_ms_min == 0.0);
+    CHECK(stats.target_gpu_ms_max == 0.0);
 }
 
 // ============================================================================
@@ -645,4 +902,69 @@ TEST_CASE("end-to-end: round-trip raw CSVs through merge to merged CSV") {
     // Sanity-check the same hand-verified header the README documents.
     CHECK(s.find("# frame_count=4\n") != std::string::npos);
     CHECK(s.find("# target_ms_mean=0.0550\n") != std::string::npos);
+    // No GPU CSVs were read for this case, so target_gpu_us stays blank on
+    // every row and the four GPU header lines all read zero.
+    CHECK(s.find("# target_gpu_frame_count=0\n") != std::string::npos);
+    CHECK(s.find("# target_gpu_ms_mean=0.0000\n") != std::string::npos);
+}
+
+TEST_CASE("end-to-end: with GPU CSVs the join fills target_gpu_us") {
+    // Same CPU fixture as the smoke test above, plus a synthetic GPU pair
+    // at 1 GHz (1 tick = 1 ns). Verifies the full pipeline:
+    //   Read{Frame,Gpu}Csv -> ComputeMerge -> JoinGpu -> ComputeStats ->
+    //   WriteMergedCsv. The merged output must carry a populated target_gpu_us
+    //   column on every frame with a valid sample on both sides, and the GPU
+    //   stat lines must reflect the actual count + min/max.
+    const std::vector<RawFrameRow> preRows = {
+        Row(0, 12345, 1'000'000, 1'001'100),
+        Row(1, 12345, 1'111'000, 1'112'000),
+    };
+    const std::vector<RawFrameRow> postRows = {
+        Row(0, 12345, 1'000'400, 1'001'000),
+        Row(1, 12345, 1'111'200, 1'111'800),
+    };
+    const auto preCsv = WriteRawCsv("e2e_gpu_pre.csv", 10'000'000, preRows);
+    const auto postCsv = WriteRawCsv("e2e_gpu_post.csv", 10'000'000, postRows);
+    // GPU: frame 0 delta 5000 ticks = 5 us; frame 1 delta 8000 ticks = 8 us.
+    const auto gpuPreCsv = WriteGpuCsv("e2e_gpu_pre_gpu.csv", {
+        GpuRow(0, 10'000, 1'000'000'000, 1),
+        GpuRow(1, 20'000, 1'000'000'000, 1),
+    });
+    const auto gpuPostCsv = WriteGpuCsv("e2e_gpu_post_gpu.csv", {
+        GpuRow(0, 15'000, 1'000'000'000, 1),
+        GpuRow(1, 28'000, 1'000'000'000, 1),
+    });
+
+    const auto pre = ReadFrameCsv(preCsv, 0);
+    const auto post = ReadFrameCsv(postCsv, 0);
+    const auto gpuPre = ReadGpuCsv(gpuPreCsv);
+    const auto gpuPost = ReadGpuCsv(gpuPostCsv);
+    CHECK(gpuPre.header_valid);
+    CHECK(gpuPost.header_valid);
+
+    auto merged = ComputeMerge(pre.rows, pre.qpc_freq,
+                               post.rows, post.qpc_freq);
+    REQUIRE(merged.size() == 2);
+    JoinGpu(merged, gpuPre.rows, gpuPost.rows);
+    REQUIRE(merged[0].target_gpu_us.has_value());
+    REQUIRE(merged[1].target_gpu_us.has_value());
+    CHECK(*merged[0].target_gpu_us == doctest::Approx(5.0));
+    CHECK(*merged[1].target_gpu_us == doctest::Approx(8.0));
+
+    const auto stats = ComputeStats(merged);
+    CHECK(stats.gpu_frame_count == 2);
+    CHECK(stats.target_gpu_ms_mean == doctest::Approx((0.005 + 0.008) / 2.0));
+    CHECK(stats.target_gpu_ms_min == doctest::Approx(0.005));
+    CHECK(stats.target_gpu_ms_max == doctest::Approx(0.008));
+
+    std::ostringstream out;
+    WriteMergedCsv(out, merged, stats);
+    const std::string s = out.str();
+    CHECK(s.find("# target_gpu_frame_count=2\n") != std::string::npos);
+    CHECK(s.find("# target_gpu_ms_mean=0.0065\n") != std::string::npos);
+    CHECK(s.find("# target_gpu_ms_min=0.0050\n") != std::string::npos);
+    CHECK(s.find("# target_gpu_ms_max=0.0080\n") != std::string::npos);
+    // Each data row carries the .3f-rounded GPU delta as its last cell.
+    CHECK(s.find(",5.000\n") != std::string::npos);
+    CHECK(s.find(",8.000\n") != std::string::npos);
 }

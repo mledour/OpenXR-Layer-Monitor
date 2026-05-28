@@ -136,6 +136,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="test_example.cpp" />
     <ClCompile Include="test_merge.cpp" />
+    <ClCompile Include="test_gpu_ring.cpp" />
     <ClCompile Include="test_integration.cpp" />
     <ClCompile Include="mock_runtime.cpp" />
     <ClCompile Include="test_stubs.cpp" />
@@ -151,11 +152,18 @@
     <ClCompile Include="..\openxr-api-layer\framework\dispatch.gen.cpp" />
     <ClCompile Include="..\openxr-api-layer\framework\log.cpp" />
     <ClCompile Include="..\openxr-api-layer\utils\merge.cpp" />
+    <!-- gpu_timer.cpp defines MakeD3D11GpuTimer, which layer.cpp's
+         xrCreateSession references. Without it the test binary's link step
+         fails with LNK2019: the layer DLL project links fine because IT
+         already includes gpu_timer.cpp, but the test binary builds its own
+         link unit, so we add the entry here too. -->
+    <ClCompile Include="..\openxr-api-layer\utils\gpu_timer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="external\doctest\doctest.h" />
     <ClInclude Include="mock_runtime.h" />
     <ClInclude Include="..\openxr-api-layer\utils\merge.h" />
+    <ClInclude Include="..\openxr-api-layer\utils\gpu_timer.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

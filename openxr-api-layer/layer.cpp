@@ -63,6 +63,11 @@
 // dragging in the OpenXR layer chain or the writer thread.
 #include "utils/merge.h"
 
+// GPU side of the sandwich: a D3D11 single-timestamp-per-frame profiler.
+// The D3D11 implementation is isolated behind gpu::IGpuTimer so layer.cpp
+// stays free of D3D query plumbing.
+#include "utils/gpu_timer.h"
+
 namespace openxr_api_layer {
 
     using namespace log;
@@ -390,19 +395,30 @@ namespace openxr_api_layer {
             alignas(64) Slot m_buffer[N]{};
         };
 
-        class FrameCsvSink {
+        // Generic background CSV writer. Two instantiations exist: the CPU
+        // sink (FrameRow) and the GPU sink (gpu::GpuRow); Traits supplies the
+        // file-name prefix, the header block, and the per-row formatter so the
+        // threading / lock-free-ring / lifecycle machinery is written once.
+        //
+        // RowT must be trivially copyable (it travels through the SPSC ring by
+        // value). Traits must provide:
+        //   static constexpr const char* kFilePrefix;          // "frames"/"gpu"
+        //   static void WriteHeader(std::ostream&);            // # lines + cols
+        //   static void WriteRow(std::ostream&, const RowT&);  // one data row
+        template <typename RowT, typename Traits>
+        class CsvSink {
           public:
-            // The g_csv instance lives at namespace scope and is destroyed
-            // during DLL unload. If the host terminated via TerminateProcess
-            // / Alt+F4 / anti-cheat kill / a crash mid-recording,
-            // xrDestroyInstance was never called, OpenXrLayer's destructor
-            // never ran, and the writer thread is still joinable. Without
-            // this destructor, ~std::thread on a joinable thread invokes
-            // std::terminate during teardown -- the layer would crash the
-            // host's exit path. Stop() is idempotent so a clean shutdown
+            // The g_csv / g_gpuCsv instances live at namespace scope and are
+            // destroyed during DLL unload. If the host terminated via
+            // TerminateProcess / Alt+F4 / anti-cheat kill / a crash mid-
+            // recording, xrDestroyInstance was never called, OpenXrLayer's
+            // destructor never ran, and the writer thread is still joinable.
+            // Without this destructor, ~std::thread on a joinable thread
+            // invokes std::terminate during teardown -- the layer would crash
+            // the host's exit path. Stop() is idempotent so a clean shutdown
             // path (where ApplyToggle(false) already stopped the writer)
             // passes through here harmlessly.
-            ~FrameCsvSink() { Stop(); }
+            ~CsvSink() { Stop(); }
 
             // Throws std::system_error if std::thread construction fails
             // (e.g., thread resource exhaustion), or std::runtime_error if
@@ -489,7 +505,7 @@ namespace openxr_api_layer {
             // 90 Hz before the ring fills).
             //
             // SINGLE PRODUCER ONLY (see SpscRingBuffer's contract).
-            void Append(const FrameRow& row) {
+            void Append(const RowT& row) {
                 if (!m_ring.Push(row)) {
                     m_droppedQueueFull.fetch_add(
                         1, std::memory_order_relaxed);
@@ -514,7 +530,7 @@ namespace openxr_api_layer {
                 // distinct. PID also goes in the name so concurrent OpenXR
                 // processes don't trample each other.
                 const std::filesystem::path path =
-                    localAppData / fmt::format("frames-{}-{}.csv",
+                    localAppData / fmt::format("{}-{}-{}.csv", Traits::kFilePrefix,
                                                GetCurrentProcessId(), kSideStr);
 
                 // LAZY OPEN: defer truncation + header write until the
@@ -539,25 +555,27 @@ namespace openxr_api_layer {
                     if (open_failed) {
                         return false;
                     }
-                    stream.open(path, std::ios::out | std::ios::trunc);
+                    // Binary mode keeps line endings LF-only on every platform.
+                    // Traits::WriteHeader / Traits::WriteRow emit '\n' literally;
+                    // without binary mode MSVC translates to "\r\n" and the per-
+                    // side CSVs end up CRLF on Windows / LF elsewhere.
+                    // MergeIntoOutput's ofstream uses the same flag for the same
+                    // reason -- keep them in sync.
+                    stream.open(path,
+                                std::ios::out | std::ios::trunc | std::ios::binary);
                     if (!stream) {
                         ErrorLog(fmt::format("Failed to open {}\n",
                                              path.string()));
                         open_failed = true;
                         return false;
                     }
-                    stream << "# qpc_freq=" << QpcFreqHz() << "\n"
-                           << "# side=" << kSideStr << "\n"
-                           << "# layer=" << LayerName << "\n"
-                           << "# fn=xrEndFrame\n"
-                           << "frame_idx,thread_id,qpc_entry,qpc_exit\n";
+                    Traits::WriteHeader(stream);
                     return true;
                 };
 
-                const auto writeOne = [&](const FrameRow& r) {
+                const auto writeOne = [&](const RowT& r) {
                     if (ensureOpen()) {
-                        stream << r.frame_idx << ',' << r.thread_id << ','
-                               << r.qpc_entry << ',' << r.qpc_exit << '\n';
+                        Traits::WriteRow(stream, r);
                     }
                 };
 
@@ -572,7 +590,7 @@ namespace openxr_api_layer {
                 // design (no notify) paid the full ~15 ms tick on
                 // every toggle-OFF, which stacked with the merge stall
                 // directly on the frame thread.
-                FrameRow row{};
+                RowT row{};
                 while (true) {
                     bool drained_any = false;
                     while (m_ring.Pop(row)) {
@@ -592,13 +610,15 @@ namespace openxr_api_layer {
                         if (stream.is_open()) {
                             stream.flush();
                         }
-                        // Footer: surface drop counts so the user knows
-                        // if the ring overflowed during the session.
-                        // Quiet when zero so the common case stays clean.
+                        // Footer: each Traits decides what end-of-session
+                        // diagnostics to emit. CPU sink writes the queue-
+                        // overflow count; GPU sink ALSO surfaces its timer's
+                        // ring-overwrite count (the GPU readback ring is
+                        // independent of this CSV ring). Quiet when there's
+                        // nothing to say so a clean session stays clean.
                         const auto drops = DroppedQueueFull();
-                        if (drops > 0 && ensureOpen()) {
-                            stream << "# session_end dropped_queue_full="
-                                   << drops << "\n";
+                        if (Traits::HasFooter(drops) && ensureOpen()) {
+                            Traits::WriteFooter(stream, drops);
                             stream.flush();
                         }
                         return;
@@ -633,10 +653,120 @@ namespace openxr_api_layer {
             // recording even if the writer thread never gets a tick of
             // CPU. Overflow is unreachable on a healthy machine; the
             // counter is here to flag pathological disk stalls.
-            SpscRingBuffer<FrameRow, 4096> m_ring;
+            SpscRingBuffer<RowT, 4096> m_ring;
         };
 
+        // ---- CSV-schema traits + sink instances --------------------------
+        //
+        // Each Traits struct is the only place a row type's on-disk format
+        // lives: the file-name prefix, the comment + column header, and the
+        // per-row formatter. CsvSink<RowT, Traits> supplies everything else.
+
+        struct FrameCsvTraits {
+            static constexpr const char* kFilePrefix = "frames";
+            static void WriteHeader(std::ostream& s) {
+                s << "# qpc_freq=" << QpcFreqHz() << "\n"
+                  << "# side=" << kSideStr << "\n"
+                  << "# layer=" << LayerName << "\n"
+                  << "# fn=xrEndFrame\n"
+                  << "frame_idx,thread_id,qpc_entry,qpc_exit\n";
+            }
+            static void WriteRow(std::ostream& s, const FrameRow& r) {
+                s << r.frame_idx << ',' << r.thread_id << ','
+                  << r.qpc_entry << ',' << r.qpc_exit << '\n';
+            }
+            // The CPU sink's only end-of-session diagnostic is the SPSC ring
+            // overflow count -- emitted only when non-zero so a clean session
+            // produces a clean CSV.
+            static bool HasFooter(uint64_t droppedQueueFull) {
+                return droppedQueueFull > 0;
+            }
+            static void WriteFooter(std::ostream& s, uint64_t droppedQueueFull) {
+                s << "# session_end dropped_queue_full=" << droppedQueueFull << "\n";
+            }
+        };
+
+        // Per-DLL singleton GPU timer, recreated on each xrCreateSession and
+        // released on each xrDestroySession. Null on non-D3D11 hosts or if
+        // query creation failed. Only ever touched from the frame thread (the
+        // D3D11 immediate context is single-threaded), so a plain unique_ptr
+        // is sufficient -- no atomic. xrCreateSession happens-before the
+        // first xrEndFrame via the app's own handoff of the XrSession handle.
+        // Declared HERE (before GpuCsvTraits) so the GPU sink's footer code
+        // can read DroppedFrames() inline.
+        //
+        // SAME SINGLE-SESSION ASSUMPTION AS THE SPSC RING ABOVE: an app that
+        // holds two XrSession handles open concurrently on the same DLL would
+        // see them share this timer. The OpenXR spec allows this in theory,
+        // but every shipping host we know of -- including OpenComposite's
+        // probe-then-real pattern -- destroys the previous session before
+        // creating the next, which IS the case xrCreateSession's `reset()`
+        // below handles. A truly concurrent-session host would have to either
+        // refuse the second session or upgrade this to a per-session map.
+        std::unique_ptr<gpu::IGpuTimer> g_gpuTimer;
+
+        struct GpuCsvTraits {
+            static constexpr const char* kFilePrefix = "gpu";
+            static void WriteHeader(std::ostream& s) {
+                // No qpc_freq line: the GPU clock frequency is per-row (it
+                // comes from each D3D11 disjoint query), so it lives in the
+                // gpu_freq column rather than a single file-level header.
+                s << "# gpu_clock=d3d11\n"
+                  << "# side=" << kSideStr << "\n"
+                  << "# layer=" << LayerName << "\n"
+                  << "# fn=xrEndFrame\n"
+                  << "frame_idx,gpu_ticks,gpu_freq,valid\n";
+            }
+            static void WriteRow(std::ostream& s, const gpu::GpuRow& r) {
+                s << r.frame_idx << ',' << r.gpu_ticks << ','
+                  << r.gpu_freq << ',' << r.valid << '\n';
+            }
+            // GPU sink surfaces TWO independent drop sources at end of
+            // session: the SPSC CSV-ring overflow (same as the CPU sink, ~45
+            // s of disk stall at 90 Hz to fill), AND the GPU TIMER's own
+            // ring-overwrite count (g_gpuTimer->DroppedFrames(), bumped when
+            // GPU readback is >kGpuRingSize frames behind, i.e. a >~44 ms
+            // GPU stall). Read here on the writer thread; the writer-thread
+            // join inside CsvSink::Stop() pairs with the render-thread
+            // relaxed fetch_add to publish the final value.
+            static uint64_t GpuRingOverflow() {
+                return g_gpuTimer ? g_gpuTimer->DroppedFrames() : 0;
+            }
+            static bool HasFooter(uint64_t droppedQueueFull) {
+                return droppedQueueFull > 0 || GpuRingOverflow() > 0;
+            }
+            static void WriteFooter(std::ostream& s, uint64_t droppedQueueFull) {
+                if (droppedQueueFull > 0) {
+                    s << "# session_end dropped_queue_full=" << droppedQueueFull << "\n";
+                }
+                const uint64_t overwritten = GpuRingOverflow();
+                if (overwritten > 0) {
+                    s << "# session_end gpu_ring_overflow=" << overwritten << "\n";
+                }
+            }
+        };
+
+        using FrameCsvSink = CsvSink<FrameRow, FrameCsvTraits>;
+        using GpuCsvSink = CsvSink<gpu::GpuRow, GpuCsvTraits>;
+
         FrameCsvSink g_csv;
+        GpuCsvSink g_gpuCsv;
+
+        // Walks an XrBaseInStructure-style `next` chain for the first
+        // XrGraphicsBindingD3D11KHR. Returns nullptr if the app uses a
+        // different graphics API (D3D12 / Vulkan / OpenGL) -- the caller then
+        // runs the session CPU-only. We rely on the common-initial-sequence
+        // layout (XrStructureType type; const void* next) shared by every
+        // OpenXR `next` struct.
+        const XrGraphicsBindingD3D11KHR* FindD3D11Binding(const void* next) {
+            for (auto* base = reinterpret_cast<const XrBaseInStructure*>(next);
+                 base != nullptr; base = base->next) {
+                if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
+                    return reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(base);
+                }
+            }
+            return nullptr;
+        }
 
         // ---- Auto-merge (post side only, on Ctrl+F9 stop or destructor) ---
         //
@@ -661,6 +791,10 @@ namespace openxr_api_layer {
                 localAppData / fmt::format("frames-{}-pre.csv", pid);
             const fs::path postCsv =
                 localAppData / fmt::format("frames-{}-post.csv", pid);
+            const fs::path gpuPreCsv =
+                localAppData / fmt::format("gpu-{}-pre.csv", pid);
+            const fs::path gpuPostCsv =
+                localAppData / fmt::format("gpu-{}-post.csv", pid);
             const fs::path outCsv =
                 localAppData / fmt::format("frames-merged-{}.csv", pid);
 
@@ -738,7 +872,7 @@ namespace openxr_api_layer {
                     pre.qpc_freq, post.qpc_freq));
             }
 
-            const auto merged = merge::ComputeMerge(
+            auto merged = merge::ComputeMerge(
                 pre.rows, pre.qpc_freq, post.rows, post.qpc_freq);
             if (merged.empty()) {
                 Log("Skipping auto-merge: no matched (frame_idx, thread_id) "
@@ -746,6 +880,28 @@ namespace openxr_api_layer {
                 removeStale();
                 return;
             }
+
+            // GPU join. Missing gpu-<pid>-{pre,post}.csv is the normal case
+            // on non-D3D11 hosts -- ReadGpuCsv returns empty + header_valid,
+            // JoinGpu then leaves every target_gpu_us blank and the merge
+            // proceeds CPU-only. A present-but-malformed GPU CSV is logged
+            // and skipped (we do NOT abort the CPU merge over it). JoinGpu
+            // must run before ComputeStats so the GPU aggregates populate.
+            const auto gpuPre = merge::ReadGpuCsv(gpuPreCsv);
+            const auto gpuPost = merge::ReadGpuCsv(gpuPostCsv);
+            if (!gpuPre.header_valid) {
+                ErrorLog(fmt::format(
+                    "GPU pre CSV has unexpected column header at {}; "
+                    "skipping GPU join (CPU merge proceeds)\n",
+                    gpuPreCsv.string()));
+            }
+            if (!gpuPost.header_valid) {
+                ErrorLog(fmt::format(
+                    "GPU post CSV has unexpected column header at {}; "
+                    "skipping GPU join (CPU merge proceeds)\n",
+                    gpuPostCsv.string()));
+            }
+            merge::JoinGpu(merged, gpuPre.rows, gpuPost.rows);
 
             const auto stats = merge::ComputeStats(merged);
             if (stats.negative_target_count > 0) {
@@ -831,23 +987,41 @@ namespace openxr_api_layer {
                 g_frameCounter.store(0, std::memory_order_relaxed);
                 g_skipNext.store(1, std::memory_order_release);
                 try {
+                    // Start both sinks. If the GPU sink throws after the CPU
+                    // sink started, undo the CPU start (Stop() is noexcept +
+                    // idempotent) so we never leave one writer running while
+                    // we bail. Symmetric for any future sink added here.
                     g_csv.Start();
+                    g_gpuCsv.Start();
                 } catch (const std::exception& e) {
                     ErrorLog(fmt::format(
                         "Writer start failed: {}\n", e.what()));
+                    g_csv.Stop();
+                    g_gpuCsv.Stop();
                     // Bail before touching local g_monitoring or shared
                     // state, so pre / post stay consistent at "off".
                     return;
                 } catch (...) {
                     ErrorLog("Writer start failed: unknown exception\n");
+                    g_csv.Stop();
+                    g_gpuCsv.Stop();
                     return;
                 }
+                // Drop any GPU slots still in flight from a PREVIOUS session:
+                // they were tagged with that session's frame_idx numbering and
+                // would otherwise resolve into the just-truncated GPU CSV under
+                // the new session's frame 0..N. Pure CPU bookkeeping, safe on
+                // the frame thread. Null on non-D3D11 hosts.
+                if (g_gpuTimer) {
+                    g_gpuTimer->Reset();
+                }
             } else {
-                g_csv.Stop();  // noexcept; catches its own join exceptions
+                g_csv.Stop();     // noexcept; catches its own join exceptions
+                g_gpuCsv.Stop();  // noexcept; flush the GPU CSV before merge
                 if constexpr (kIsPostSide) {
                     // Post is downstream, so by the time we reach this
                     // line pre's ApplyToggle has already returned -- which
-                    // means pre's writer is drained and pre's CSV is
+                    // means pre's writers are drained and pre's CSVs are
                     // closed. Safe to merge synchronously.
                     try {
                         MergeIntoOutput();
@@ -915,7 +1089,7 @@ namespace openxr_api_layer {
         // Destructors are implicitly noexcept since C++11; an exception
         // escaping here calls std::terminate and takes the game down at
         // xrDestroyInstance. Everything that can throw is wrapped, and
-        // g_csv.Stop() is itself declared noexcept.
+        // g_csv.Stop() / g_gpuCsv.Stop() are themselves declared noexcept.
         ~OpenXrLayer() override {
             if (!g_monitoring.load(std::memory_order_acquire)) {
                 // Either: user pressed Ctrl+F9 to stop, and the merge
@@ -923,7 +1097,8 @@ namespace openxr_api_layer {
                 // a session, and there is nothing to merge.
                 return;
             }
-            g_csv.Stop();  // noexcept
+            g_csv.Stop();     // noexcept
+            g_gpuCsv.Stop();  // noexcept; flush GPU CSV before the merge reads it
             if constexpr (kIsPostSide) {
                 try {
                     MergeIntoOutput();
@@ -970,6 +1145,11 @@ namespace openxr_api_layer {
                 (localAppData / fmt::format("frames-{}-{}.csv",
                                             GetCurrentProcessId(), kSideStr))
                     .string()));
+            Log(fmt::format(
+                "GPU timings (D3D11 hosts only) will be written to: {}\n",
+                (localAppData / fmt::format("gpu-{}-{}.csv",
+                                            GetCurrentProcessId(), kSideStr))
+                    .string()));
             Log("Press Ctrl+F9 (system-wide hotkey) to start / stop monitoring\n");
 
             // Seed g_lastComboDown with the CURRENT physical key state so
@@ -1000,6 +1180,65 @@ namespace openxr_api_layer {
             // ApplyToggle(true), which spins up the writer and truncates
             // the per-side CSV.
             return result;
+        }
+
+        // xrCreateSession stands up the per-session D3D11 GPU timer from the
+        // app's ID3D11Device (XrGraphicsBindingD3D11KHR in createInfo->next).
+        // We never mutate createInfo and never fail the host's session over a
+        // GPU-timer problem (CLAUDE.md rule 9: degrade gracefully) -- a
+        // non-D3D11 host or a query-creation failure just means GPU rows are
+        // not written and target_gpu_us comes out blank in the merge.
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrCreateSession
+        XrResult xrCreateSession(XrInstance instance,
+                                 const XrSessionCreateInfo* createInfo,
+                                 XrSession* session) override {
+            const XrResult result =
+                OpenXrApi::xrCreateSession(instance, createInfo, session);
+            if (XR_FAILED(result) || !createInfo) {
+                return result;
+            }
+
+            TraceLoggingWrite(g_traceProvider,
+                              "xrCreateSession",
+                              TLArg(kSideStr, "Side"));
+
+            // Drop any timer from a prior session of this instance before
+            // building the new one (multi-session hosts: OpenComposite does a
+            // probe session then the real one). Releasing first keeps at most
+            // one timer's query objects alive at a time.
+            g_gpuTimer.reset();
+
+            if (const auto* binding = FindD3D11Binding(createInfo->next)) {
+                g_gpuTimer = gpu::MakeD3D11GpuTimer(binding->device);
+                if (g_gpuTimer) {
+                    Log(fmt::format(
+                        "GPU timer active (D3D11) on side='{}'\n", kSideStr));
+                } else {
+                    Log("D3D11 binding present but GPU query creation failed; "
+                        "target_gpu_us will be blank for this session\n");
+                }
+            } else {
+                Log("No D3D11 binding in xrCreateSession (D3D12 / Vulkan / "
+                    "OpenGL host); GPU monitoring off, CPU monitoring active\n");
+            }
+            return result;
+        }
+
+        // xrDestroySession releases the GPU timer's query objects before the
+        // session's device can go away. It deliberately does NOT stop the CSV
+        // sinks or touch g_monitoring: the OpenXR spec allows multiple
+        // create/destroy-session cycles per instance, and the recording +
+        // merge lifecycle is owned by the Ctrl+F9 toggle and xrDestroyInstance
+        // (the ~OpenXrLayer fallback), not by session teardown. Any GPU slots
+        // still in flight are dropped (the last 1-3 frames of a session may
+        // lack GPU rows -- the merge tolerates the gap).
+        // https://registry.khronos.org/OpenXR/specs/1.0/html/xrspec.html#xrDestroySession
+        XrResult xrDestroySession(XrSession session) override {
+            TraceLoggingWrite(g_traceProvider,
+                              "xrDestroySession",
+                              TLArg(kSideStr, "Side"));
+            g_gpuTimer.reset();
+            return OpenXrApi::xrDestroySession(session);
         }
 
         // xrEndFrame is split into two distinct code paths via constexpr
@@ -1062,15 +1301,27 @@ namespace openxr_api_layer {
                     return OpenXrApi::xrEndFrame(session, frameEndInfo);
                 }
 
+                // frame_idx + GPU marker BEFORE the narrow bracket. The GPU
+                // RecordTimestamp issues three immediate-context calls; those
+                // are pre's OWN overhead and must stay OUTSIDE the bracket (in
+                // it they would inflate pre.bracket and hence target_us).
+                // T_pre marks the command stream as the last GPU event before
+                // the target's draws. frame_idx is fetched here so the GPU row
+                // and the CPU row below share the same index (the merge joins
+                // GPU pre<->post and GPU<->CPU on frame_idx).
+                const uint64_t frame_idx =
+                    g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+                const uint32_t thread_id = GetCurrentThreadId();
+                if (g_gpuTimer) {
+                    g_gpuTimer->RecordTimestamp(frame_idx);
+                }
+
                 // Narrow bracket -- pre's own work is OUTSIDE.
                 const int64_t qpc_entry = Qpc();
                 const XrResult result =
                     OpenXrApi::xrEndFrame(session, frameEndInfo);
                 const int64_t qpc_exit = Qpc();
 
-                const uint64_t frame_idx =
-                    g_frameCounter.fetch_add(1, std::memory_order_relaxed);
-                const uint32_t thread_id = GetCurrentThreadId();
                 TraceLoggingWrite(g_traceProvider,
                                   "xrEndFrame",
                                   TLArg(kSideStr, "Side"),
@@ -1079,6 +1330,10 @@ namespace openxr_api_layer {
                                   TLArg(qpc_exit, "QpcExit"),
                                   TLArg(qpc_exit - qpc_entry, "QpcDelta"));
                 g_csv.Append({frame_idx, thread_id, qpc_entry, qpc_exit});
+
+                // Drain resolved GPU timestamps AFTER qpc_exit (outside the
+                // narrow bracket) so the GetData polls never inflate target_us.
+                DrainGpu();
                 return result;
             } else {
                 // -------- POST side (wide bracket) --------
@@ -1109,12 +1364,26 @@ namespace openxr_api_layer {
                     return OpenXrApi::xrEndFrame(session, frameEndInfo);
                 }
 
-                const XrResult result =
-                    OpenXrApi::xrEndFrame(session, frameEndInfo);
-
+                // frame_idx + GPU marker INSIDE the wide bracket (before the
+                // runtime call). Both cancel in the pre-minus-post subtraction,
+                // so they add no bias to target_us. T_post marks the command
+                // stream right after the target's draws and before the
+                // runtime/compositor's GPU work, so (T_post - T_pre) brackets
+                // exactly the target's GPU work.
                 const uint64_t frame_idx =
                     g_frameCounter.fetch_add(1, std::memory_order_relaxed);
                 const uint32_t thread_id = GetCurrentThreadId();
+                if (g_gpuTimer) {
+                    g_gpuTimer->RecordTimestamp(frame_idx);
+                    // Drain INSIDE the bracket too: the GetData polls then
+                    // cancel in the subtraction rather than becoming residual
+                    // target_us bias (they would otherwise sit after qpc_exit).
+                    DrainGpu();
+                }
+
+                const XrResult result =
+                    OpenXrApi::xrEndFrame(session, frameEndInfo);
+
                 // ETW emitted INSIDE post's bracket with qpc_entry only.
                 // qpc_exit is not known yet (we take it as late as
                 // possible, just before Append, so post's TraceLogging
@@ -1137,6 +1406,26 @@ namespace openxr_api_layer {
                 return result;
             }
         }
+
+      private:
+        // Drain every GPU timestamp the timer has resolved since the last poll
+        // and append each to the GPU CSV sink. m_gpuResolved is reused across
+        // frames (cleared, capacity retained) so the render-thread hot path
+        // never allocates after warm-up. Self-guards on a null timer so PRE
+        // can call it unconditionally.
+        void DrainGpu() {
+            if (!g_gpuTimer) {
+                return;
+            }
+            m_gpuResolved.clear();
+            g_gpuTimer->PollResolved(m_gpuResolved);
+            for (const auto& row : m_gpuResolved) {
+                g_gpuCsv.Append(row);
+            }
+        }
+
+        // Reusable scratch buffer for DrainGpu (render thread only).
+        std::vector<gpu::GpuRow> m_gpuResolved;
     };
 
     // See framework/dispatch.gen.cpp -- g_instance is reset on xrDestroyInstance
