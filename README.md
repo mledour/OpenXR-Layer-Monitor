@@ -29,7 +29,7 @@ noise floor; even a sub-µs target layer is mostly faithfully measured.
 
 For **GPU cost** the same idea applies, but the endpoints are single GPU
 timestamps in the command stream rather than a pair on each side. Pre
-inserts a D3D11 timestamp just before forwarding to the target; post
+inserts a GPU timestamp just before forwarding to the target; post
 inserts one at the very start of its `xrEndFrame` (i.e. right after the
 target finished submitting). The merge subtracts:
 
@@ -37,10 +37,22 @@ target finished submitting). The merge subtracts:
 target_gpu_us = (post_gpu_ticks - pre_gpu_ticks) / gpu_freq * 1e6
 ```
 
-This is read back asynchronously a few frames later via D3D11 timestamp
-queries with `D3D11_ASYNC_GETDATA_DONOTFLUSH`. D3D12 and Vulkan are not
-yet wired up; on those hosts the GPU column stays blank, the CPU sandwich
-keeps working.
+Both **D3D11** and **D3D12** are wired up:
+
+- **D3D11**: timestamps go through `ID3D11DeviceContext::End` on the app's
+  immediate context, each wrapped in a tiny `D3D11_QUERY_TIMESTAMP_DISJOINT`
+  bracket for the frequency + clock-stability flag. Read back asynchronously
+  a few frames later via `GetData(..., D3D11_ASYNC_GETDATA_DONOTFLUSH)`.
+- **D3D12**: each side owns a tiny pair (`ID3D12CommandAllocator`,
+  `ID3D12GraphicsCommandList`) per ring slot. The command list does just
+  `EndQuery(TIMESTAMP)` + `ResolveQueryData` into a per-slot offset in a
+  `READBACK` heap. It is submitted on the app's own command queue
+  (`ID3D12CommandQueue` pulled from `XrGraphicsBindingD3D12KHR`), gated by
+  an `ID3D12Fence`; the readback buffer is `Map`'d once the fence reaches
+  the slot's value. No D3D11On12 wrapper, no extra translation layer.
+
+Vulkan / OpenGL hosts get a blank GPU column; the CPU sandwich keeps
+working.
 
 ## What you can do with it
 
@@ -62,7 +74,8 @@ both `target_us` and `target_gpu_us` columns.
 | -------------------------------- | ------ |
 | CPU sandwich on `xrEndFrame`     | yes |
 | GPU sandwich on `xrEndFrame` (D3D11) | yes |
-| GPU sandwich (D3D12 / Vulkan)    | not yet |
+| GPU sandwich on `xrEndFrame` (D3D12) | yes |
+| GPU sandwich (Vulkan / OpenGL)   | not yet |
 | Other per-frame functions        | not yet (planned: `xrWaitFrame`, `xrBeginFrame`, `xrLocateViews`) |
 | ETW emission                     | yes (`TraceLoggingWrite`, capture with `scripts\Tracing.wprp`) |
 | CSV per process                  | yes (CPU + GPU, separate files merged on Ctrl+F9 stop) |
@@ -354,7 +367,7 @@ per-side names so they coexist there; the per-frame CSVs carry a
     XR_APILAYER_MLEDOUR_layer_monitor_post.log
     frames-<pid>-pre.csv                           CPU bracket per xrEndFrame call (truncated on each Ctrl+F9 start)
     frames-<pid>-post.csv
-    gpu-<pid>-pre.csv                              GPU timestamp per xrEndFrame call -- D3D11 hosts only; absent on D3D12 / Vulkan / OpenGL
+    gpu-<pid>-pre.csv                              GPU timestamp per xrEndFrame call -- D3D11 OR D3D12 hosts; absent on Vulkan / OpenGL
     gpu-<pid>-post.csv
     frames-merged-<pid>.csv                        auto-written by post on Ctrl+F9 stop or xrDestroyInstance fallback
 ```
@@ -372,10 +385,16 @@ frame_idx,thread_id,qpc_entry,qpc_exit
 ...
 ```
 
-GPU CSV format (`gpu_freq` is per row -- D3D11 reports the clock rate
-on each disjoint query rather than once for the whole file; `valid=0`
-means the disjoint query reported Disjoint or a zero frequency at the
-moment of the timestamp):
+GPU CSV format. `# gpu_clock=` carries the active backend name (either
+`d3d11` or `d3d12`). `gpu_freq` is per row -- D3D11 reports the clock
+rate on each disjoint query (it can change between frames on power-state
+transitions), D3D12 fixes it once at queue creation and reports the same
+value on every row. `valid=0` means the sample is unusable for the merge:
+on D3D11 the disjoint query reported Disjoint or a zero frequency at the
+moment of the timestamp; on D3D12 the `Map` of the readback buffer
+failed (no per-query disjoint flag exists on D3D12 -- the queue's
+`GetTimestampFrequency()` is trusted for the lifetime of the queue,
+matching what OpenXR Toolkit and fpsVR do).
 
 ```
 # gpu_clock=d3d11
@@ -432,11 +451,11 @@ frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,target_pct_of_fra
 All `#`-prefixed values are bare numbers (no unit) except
 `target_pct_*` which carries a literal `%` after the value for
 visual clarity. The four GPU stat lines are zero (and the
-`target_gpu_us` column is blank on every row) when no D3D11
-graphics binding was found in `xrCreateSession` -- the schema
-stays the same so a single parser handles every session. All line
-endings are LF (the C++ writer opens the file in binary mode, the
-Python writer uses `lineterminator='\n'`).
+`target_gpu_us` column is blank on every row) when neither a D3D11
+nor a D3D12 graphics binding was found in `xrCreateSession` (Vulkan /
+OpenGL hosts) -- the schema stays the same so a single parser handles
+every session. All line endings are LF (the C++ writer opens the file
+in binary mode, the Python writer uses `lineterminator='\n'`).
 
 ## How it works
 
@@ -475,19 +494,48 @@ the target layer's score.
   (worker threads, fire-and-forget compute) is invisible to the sandwich
   -- it only sees what the layer does synchronously inside its
   `xrEndFrame` override.
-- **GPU sandwich is D3D11 only.** D3D12 / Vulkan / OpenGL hosts get
-  blank `target_gpu_us`; the CPU sandwich still works. The D3D11 path
-  measures only work submitted on the app's **immediate context** in
-  **command-stream order** between the two timestamps: a target that
-  renders on a deferred context, a private device, or a separate
-  queue is invisible to the GPU measurement. The per-side disjoint
-  query covers only the *instant* of each timestamp -- a GPU clock
-  change happening between `T_pre` and `T_post` may go unflagged
-  (frequency mismatch IS caught and blanks the frame; a Disjoint flag
-  on either side blanks the frame; rare). Each GPU sample is read back
-  ~3 frames late through an async readback ring, so the last few
-  frames of a session can be missing GPU rows -- the merge tolerates
-  the gap (CPU row present, GPU column blank).
+- **GPU sandwich runs on D3D11 and D3D12; Vulkan / OpenGL hosts get
+  blank `target_gpu_us`** (the CPU sandwich still works).
+  Common to both backends:
+    - Captures only work submitted **in command-stream order between
+      the two timestamps** on the app's render queue (D3D12) or
+      immediate context (D3D11). A target that renders on a deferred
+      context, a private device, or a separate queue is invisible to
+      the GPU measurement.
+    - Each GPU sample is read back ~3 frames late through an async
+      readback ring, so the last few frames of a session can be
+      missing GPU rows -- the merge tolerates the gap (CPU row
+      present, `target_gpu_us` blank).
+    - The merge guards both sides at join time: `pre.gpu_freq ==
+      post.gpu_freq`, `post_ticks >= pre_ticks`, and `valid != 0` on
+      both rows. A frame failing any check is blanked rather than
+      contributing a noisy value.
+  Backend-specific caveats:
+    - **D3D11**: the per-side disjoint query covers only the *instant*
+      of each timestamp, so a GPU clock change happening between
+      `T_pre` and `T_post` may go unflagged by the Disjoint bit. A
+      frequency mismatch IS caught (and blanks the frame); a Disjoint
+      flag on either side blanks the frame. Both events are rare.
+    - **D3D12**: no per-query disjoint flag exists; the queue's
+      `GetTimestampFrequency()` is trusted for the queue's lifetime
+      (same convention OpenXR Toolkit / fpsVR / XrTelemetry use).
+      `valid=1` on a D3D12 row only means the readback `Map` succeeded,
+      *not* that the GPU clock was stable across the measured span.
+      A driver TDR (device removed) between `Signal` and `Map` can in
+      principle leave a row with `valid=1` holding the stale contents
+      of the readback buffer; the merge's `post_ticks >= pre_ticks`
+      and frequency-match guards catch the common shapes of corruption
+      but a coincidental match-after-corruption would not be detected.
+      Re-run any session that crossed a driver restart / TDR.
+      Each frame's GPU instrumentation adds one tiny
+      `ExecuteCommandLists` on the app's queue (an `EndQuery` + a
+      `ResolveQueryData` of a single `UINT64`); CPU cost is a single-
+      digit-microsecond syscall sequence, kept OUT of the pre-side
+      bracket so it does not bias `target_us`. If the GPU stalls
+      beyond the ring's depth (~44 ms at 90 Hz), the D3D12 backend
+      SKIPS the frame's GPU sample rather than crash on a forbidden
+      command-allocator reset, and bumps `# session_end
+      gpu_ring_overflow` in the GPU CSV footer to surface it.
 - **Layer ordering is on you.** If a fourth layer slips between pre and
   the target (or between target and post), its CPU gets billed to the
   target. Always sanity-check `reg query` after install.
