@@ -328,6 +328,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClInclude Include="framework\util.h" />
     <ClInclude Include="layer.h" />
     <ClInclude Include="pch.h" />
+    <ClInclude Include="utils\gpu_timer.h" />
     <ClInclude Include="utils\merge.h" />
     <!-- Place your layer-specific headers under utils\ and register them
          here, e.g. <ClInclude Include="utils\my_logic.h" /> -->
@@ -338,6 +339,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)\scripts\Gene
     <ClCompile Include="framework\entry.cpp" />
     <ClCompile Include="framework\log.cpp" />
     <ClCompile Include="layer.cpp" />
+    <ClCompile Include="utils\gpu_timer.cpp" />
     <ClCompile Include="utils\merge.cpp" />
     <!-- Place your layer-specific .cpp files under utils\ and register them
          here, e.g. <ClCompile Include="utils\my_logic.cpp" /> -->

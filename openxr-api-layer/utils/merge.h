@@ -44,6 +44,18 @@ namespace openxr_api_layer::merge {
         int64_t qpc_exit;
     };
 
+    // One row of a per-side gpu-<pid>-{pre,post}.csv, parsed from disk.
+    // valid == 0 means the timestamp is unusable for this frame (the D3D11
+    // disjoint query reported Disjoint, or frequency came back 0); JoinGpu
+    // skips any frame whose pre OR post row is invalid. Not thread-tagged:
+    // D3D11 GPU submission is single-threaded, so frame_idx alone is the key.
+    struct RawGpuRow {
+        uint64_t frame_idx;
+        uint64_t gpu_ticks;
+        uint64_t gpu_freq;
+        uint32_t valid;
+    };
+
     // Result of parsing a per-side CSV. qpc_freq comes from the
     // "# qpc_freq=..." header line; if the header is missing or malformed,
     // ReadFrameCsv falls back to whatever defaultFreq the caller passed.
@@ -60,13 +72,32 @@ namespace openxr_api_layer::merge {
         bool header_valid;
     };
 
+    // Result of parsing a per-side gpu-<pid>-{pre,post}.csv. A MISSING file
+    // (the common case on D3D12 / Vulkan / OpenGL hosts, where no GPU timer
+    // is created) yields rows = {} and header_valid = true, so the merge
+    // degrades to CPU-only with every target_gpu_us blank. header_valid is
+    // flipped to false only when the file exists but its column-header line
+    // is not exactly kExpectedGpuColumnHeader; callers warn and proceed
+    // CPU-only rather than aborting the whole merge.
+    struct ParsedGpuCsv {
+        std::vector<RawGpuRow> rows;
+        bool header_valid;
+    };
+
     // Expected raw per-side CSV column header, exactly. Any deviation
-    // (including the 7-column merged-CSV header) is rejected.
+    // (including the 8-column merged-CSV header) is rejected.
     inline constexpr const char* kExpectedColumnHeader =
         "frame_idx,thread_id,qpc_entry,qpc_exit";
 
-    // One row of the merged CSV. Optionals are blanked out for the last
-    // frame per thread (no successor -> no interval -> no pct).
+    // Expected per-side GPU CSV column header, exactly.
+    inline constexpr const char* kExpectedGpuColumnHeader =
+        "frame_idx,gpu_ticks,gpu_freq,valid";
+
+    // One row of the merged CSV. Optionals are blanked out when undefined:
+    //   frame_interval_us / target_pct_of_frame -> last frame per thread (no
+    //       successor) or a non-positive interval.
+    //   target_gpu_us -> no GPU row on one/both sides for this frame, an
+    //       invalid GPU sample, or a GPU clock mismatch (see JoinGpu).
     struct MergedRow {
         uint64_t frame_idx;
         uint32_t thread_id;
@@ -75,6 +106,7 @@ namespace openxr_api_layer::merge {
         double post_us;
         double target_us;
         std::optional<double> target_pct_of_frame;
+        std::optional<double> target_gpu_us;
     };
 
     // Session-summary numbers written as # comment lines at the top of the
@@ -92,6 +124,15 @@ namespace openxr_api_layer::merge {
         double target_pct_min;
         double target_pct_max;
         size_t negative_target_count;
+        // GPU aggregates over the frames that have a target_gpu_us (i.e. a
+        // valid GPU sample on BOTH sides). gpu_frame_count == 0 means no GPU
+        // data was captured this session (non-D3D11 host, or GPU timer
+        // creation failed) -- the ms_* fields are then 0.0 and the merged
+        // CSV's target_gpu_us column is blank on every row.
+        size_t gpu_frame_count;
+        double target_gpu_ms_mean;
+        double target_gpu_ms_min;
+        double target_gpu_ms_max;
     };
 
     // Returns rows = {} and qpc_freq = defaultFreq if the file is missing,
@@ -101,6 +142,13 @@ namespace openxr_api_layer::merge {
     // row level (truncated parse).
     ParsedFrameCsv ReadFrameCsv(const std::filesystem::path& path,
                                 int64_t defaultFreq);
+
+    // Parses a per-side GPU CSV. Returns rows = {} and header_valid = true
+    // when the file is missing (the expected case on non-D3D11 hosts), and
+    // header_valid = false when the file exists but the column header is not
+    // exactly kExpectedGpuColumnHeader. Rows that don't parse cleanly are
+    // skipped silently (truncated parse), matching ReadFrameCsv.
+    ParsedGpuCsv ReadGpuCsv(const std::filesystem::path& path);
 
     // Joins preRows + postRows by (frame_idx, thread_id), computes
     // target_us = pre_bracket - post_bracket, derives frame_interval_us
@@ -128,15 +176,39 @@ namespace openxr_api_layer::merge {
         const std::vector<RawFrameRow>& preRows, int64_t preFreq,
         const std::vector<RawFrameRow>& postRows, int64_t postFreq);
 
-    // Aggregate mean/min/max + negative-count over `merged`. Empty `merged`
-    // yields all zeros and frame_count=0.
+    // Fills target_gpu_us on each MergedRow by joining preGpu + postGpu on
+    // frame_idx (GPU rows carry no thread_id). For a given frame:
+    //
+    //   target_gpu_us = (post.gpu_ticks - pre.gpu_ticks) / pre.gpu_freq * 1e6
+    //
+    // left BLANK (target_gpu_us stays nullopt) unless ALL of:
+    //   * a GPU row exists on BOTH sides for that frame_idx,
+    //   * both rows are valid (valid != 0),
+    //   * pre.gpu_freq == post.gpu_freq and is non-zero (a frequency change
+    //     between the two timestamps means the GPU clock was disjoint across
+    //     the measured span -- the delta would be meaningless),
+    //   * post.gpu_ticks >= pre.gpu_ticks (a backwards counter is a driver
+    //     bug; treating the unsigned wrap as a huge delta would poison stats).
+    //
+    // Must run BEFORE ComputeStats so the GPU aggregates see the populated
+    // target_gpu_us values. Mutates `merged` in place. Duplicate frame_idx in
+    // either GPU input resolves last-wins (matches analyze.py's dict join).
+    void JoinGpu(std::vector<MergedRow>& merged,
+                 const std::vector<RawGpuRow>& preGpu,
+                 const std::vector<RawGpuRow>& postGpu);
+
+    // Aggregate mean/min/max + negative-count over `merged`, including the
+    // GPU aggregates over rows that have a target_gpu_us. Empty `merged`
+    // yields all zeros and frame_count = gpu_frame_count = 0. Call AFTER
+    // JoinGpu so the GPU stats reflect the joined values.
     MergeStats ComputeStats(const std::vector<MergedRow>& merged);
 
-    // Writes the merged CSV with seven `#`-comment header lines (stats),
-    // then the column header, then one row per MergedRow. Output is LF-
-    // only regardless of platform; the caller is responsible for opening
-    // `out` in a mode that does not translate line endings (binary mode
-    // on Windows).
+    // Writes the merged CSV with eleven `#`-comment header lines (seven CPU
+    // stats + four GPU stats), then the column header, then one row per
+    // MergedRow. The trailing column is target_gpu_us (blank when the row
+    // has no GPU sample). Output is LF-only regardless of platform; the
+    // caller is responsible for opening `out` in a mode that does not
+    // translate line endings (binary mode on Windows).
     void WriteMergedCsv(std::ostream& out,
                         const std::vector<MergedRow>& merged,
                         const MergeStats& stats);

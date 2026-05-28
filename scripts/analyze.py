@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Merge pre/post frames-<pid>.csv from XR_APILAYER_MLEDOUR_layer_monitor and
-emit one row per frame with the target layer's CPU cost both in microseconds
-and as a percentage of the host's per-frame wall-clock budget.
+emit one row per frame with the target layer's CPU cost (microseconds + % of
+the host's per-frame budget) and, when GPU CSVs are present, its GPU cost.
 
 Usage:
     python analyze.py <pre.csv> <post.csv> [--out OUT]
+                       [--gpu-pre GPU_PRE] [--gpu-post GPU_POST]
 
 By default --out is `frames-merged-<pid>.csv` next to the inputs (the PID
 is extracted from the `frames-<pid>-pre.csv` naming convention), matching
-the path the in-DLL auto-merge writes to.
+the path the in-DLL auto-merge writes to. --gpu-pre / --gpu-post default to
+the sibling `gpu-<pid>-{pre,post}.csv` files; if they are absent (the normal
+case on D3D12 / Vulkan / OpenGL hosts) the GPU column is left blank.
 
 Math:
     pre_us            = (pre_exit  - pre_entry)  / qpc_freq * 1e6
@@ -16,12 +19,17 @@ Math:
     target_us         = pre_us - post_us
     frame_interval_us = pre_entry[i+1] - pre_entry[i]      (per thread)
     target_pct_of_frame = target_us / frame_interval_us * 100
+    target_gpu_us     = (gpu_post_ticks - gpu_pre_ticks) / gpu_freq * 1e6
+                        (joined by frame_idx; blank unless both GPU rows are
+                         valid, share a frequency, and post_ticks >= pre_ticks)
 
 Output columns (one row per matched frame, sorted by thread then frame_idx):
-    frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,target_pct_of_frame
+    frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,
+    target_pct_of_frame,target_gpu_us
 
 The last frame per thread has no successor, so frame_interval_us and
-target_pct_of_frame are left blank for that row.
+target_pct_of_frame are left blank for that row. target_gpu_us is blank for
+any frame without a valid GPU sample on both sides.
 
 Rows are paired by (frame_idx, thread_id). Mismatched counts are reported
 as warnings and the script joins on the common subset.
@@ -38,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 RAW_COLUMNS = ("frame_idx", "thread_id", "qpc_entry", "qpc_exit")
+GPU_COLUMNS = ("frame_idx", "gpu_ticks", "gpu_freq", "valid")
 
 
 @dataclass
@@ -45,6 +54,12 @@ class Frames:
     side: str
     qpc_freq: int
     rows: list[tuple[int, int, int, int]]  # frame_idx, thread_id, qpc_entry, qpc_exit
+
+
+@dataclass
+class GpuFrames:
+    side: str
+    rows: list[tuple[int, int, int, int]]  # frame_idx, gpu_ticks, gpu_freq, valid
 
 
 def load(path: Path) -> Frames:
@@ -83,6 +98,45 @@ def load(path: Path) -> Frames:
     )
 
 
+def load_gpu(path: Path) -> GpuFrames | None:
+    """Load a per-side GPU CSV (gpu-<pid>-{pre,post}.csv).
+
+    Returns None when the file is absent -- the normal case on non-D3D11
+    hosts, where the layer never creates a GPU timer -- so the caller merges
+    CPU-only with every target_gpu_us blank. A present-but-malformed column
+    header is warned about and also treated as absent (returns None), matching
+    the C++ merge, which logs and proceeds CPU-only rather than aborting.
+    """
+    if not path.exists():
+        return None
+    meta: dict[str, str] = {}
+    rows: list[tuple[int, int, int, int]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        header_found = False
+        for raw in reader:
+            if not raw:
+                continue
+            cell = raw[0]
+            if cell.startswith("#"):
+                key, _, value = cell.lstrip("# ").partition("=")
+                meta[key.strip()] = value.strip()
+                continue
+            if not header_found:
+                if tuple(raw) != GPU_COLUMNS:
+                    print(
+                        f"warning: {path}: unexpected GPU column header "
+                        f"{raw!r}, expected {list(GPU_COLUMNS)!r}; "
+                        f"skipping GPU join",
+                        file=sys.stderr,
+                    )
+                    return None
+                header_found = True
+                continue
+            rows.append((int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3])))
+    return GpuFrames(side=meta.get("side", path.stem), rows=rows)
+
+
 def default_out_path(pre_path: Path) -> Path:
     """Pick the merged-CSV path that mirrors the in-DLL output naming.
 
@@ -94,6 +148,45 @@ def default_out_path(pre_path: Path) -> Path:
     if m:
         return pre_path.parent / f"frames-merged-{m.group(1)}.csv"
     return Path("frames-merged.csv")
+
+
+def default_gpu_path(frames_path: Path) -> Path:
+    """Sibling GPU CSV for a per-side frames CSV.
+
+    `frames-<pid>-pre.csv` -> `gpu-<pid>-pre.csv` next to it (same for post).
+    For an unconventional name we still point at a `gpu-`-prefixed sibling,
+    which simply won't exist and so resolves to "no GPU data".
+    """
+    name = frames_path.name
+    if name.startswith("frames-"):
+        return frames_path.with_name("gpu-" + name[len("frames-"):])
+    return frames_path.with_name("gpu-" + name)
+
+
+def gpu_target_us(
+    fi: int,
+    pre_idx: dict[int, tuple[int, int, int]],
+    post_idx: dict[int, tuple[int, int, int]],
+) -> float | None:
+    """target_gpu_us for one frame, or None if it can't be computed.
+
+    Blank (None) unless BOTH sides have a row for this frame_idx, both are
+    valid, the frequencies match and are non-zero, and post_ticks >=
+    pre_ticks. Mirrors the C++ JoinGpu guards exactly.
+    """
+    p = pre_idx.get(fi)
+    q = post_idx.get(fi)
+    if p is None or q is None:
+        return None
+    pre_ticks, pre_freq, pre_valid = p
+    post_ticks, post_freq, post_valid = q
+    if not pre_valid or not post_valid:
+        return None
+    if pre_freq == 0 or pre_freq != post_freq:
+        return None
+    if post_ticks < pre_ticks:
+        return None
+    return (post_ticks - pre_ticks) / pre_freq * 1e6
 
 
 def percentile(sorted_values: list[float], pct: float) -> float:
@@ -129,12 +222,24 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=None,
                     help="merged per-frame output "
                          "(default: frames-merged-<pid>.csv alongside the inputs)")
+    ap.add_argument("--gpu-pre", type=Path, default=None,
+                    help="pre-side gpu-<pid>-pre.csv "
+                         "(default: sibling gpu-<pid>-pre.csv; absent = no GPU)")
+    ap.add_argument("--gpu-post", type=Path, default=None,
+                    help="post-side gpu-<pid>-post.csv "
+                         "(default: sibling gpu-<pid>-post.csv; absent = no GPU)")
     args = ap.parse_args()
     if args.out is None:
         args.out = default_out_path(args.pre)
+    if args.gpu_pre is None:
+        args.gpu_pre = default_gpu_path(args.pre)
+    if args.gpu_post is None:
+        args.gpu_post = default_gpu_path(args.post)
 
     pre = load(args.pre)
     post = load(args.post)
+    gpu_pre = load_gpu(args.gpu_pre)
+    gpu_post = load_gpu(args.gpu_post)
 
     if pre.side != "pre":
         print(f"warning: {args.pre} reports side={pre.side!r}, expected 'pre'", file=sys.stderr)
@@ -143,6 +248,16 @@ def main() -> int:
     if pre.qpc_freq != post.qpc_freq:
         print(f"warning: qpc_freq mismatch pre={pre.qpc_freq} post={post.qpc_freq} -- using pre",
               file=sys.stderr)
+
+    # Index GPU rows by frame_idx (GPU rows carry no thread_id; D3D11 GPU
+    # submission is single-threaded). last-wins on duplicate keys, matching
+    # the C++ std::map[key] = r join.
+    gpu_pre_idx: dict[int, tuple[int, int, int]] = {}
+    gpu_post_idx: dict[int, tuple[int, int, int]] = {}
+    if gpu_pre is not None:
+        gpu_pre_idx = {r[0]: (r[1], r[2], r[3]) for r in gpu_pre.rows}
+    if gpu_post is not None:
+        gpu_post_idx = {r[0]: (r[1], r[2], r[3]) for r in gpu_post.rows}
 
     freq = pre.qpc_freq
     qpc_to_us = lambda ticks: ticks / freq * 1e6  # noqa: E731
@@ -163,7 +278,9 @@ def main() -> int:
 
     post_index = {(r[0], r[1]): r for r in post.rows}
     pre_only = 0
-    merged: list[tuple[int, int, float | None, float, float, float, float | None]] = []
+    merged: list[
+        tuple[int, int, float | None, float, float, float, float | None, float | None]
+    ] = []
     for fi, tid, pe, px in pre.rows:
         prow = post_index.pop((fi, tid), None)
         if prow is None:
@@ -189,7 +306,12 @@ def main() -> int:
                 frame_interval_us = fiv
                 target_pct = target_us / fiv * 100.0
 
-        merged.append((fi, tid, frame_interval_us, pre_us, post_us, target_us, target_pct))
+        # GPU join by frame_idx -- blank when no valid GPU sample on both
+        # sides. Matches the C++ JoinGpu guards.
+        target_gpu = gpu_target_us(fi, gpu_pre_idx, gpu_post_idx)
+
+        merged.append((fi, tid, frame_interval_us, pre_us, post_us, target_us,
+                       target_pct, target_gpu))
 
     post_only = len(post_index)
     if pre_only or post_only:
@@ -206,12 +328,15 @@ def main() -> int:
     target_values = [r[5] for r in merged]
     interval_values = [r[2] for r in merged if r[2] is not None]
     pct_values = [r[6] for r in merged if r[6] is not None]
+    gpu_values = [r[7] for r in merged if r[7] is not None]
 
     print(f"matched frames: {len(merged)}")
     print()
     print_stats("target_us         ", target_values, "(microseconds)")
     print()
     print_stats("target_pct_of_frame", pct_values, "(% of frame interval)", fmt="8.3f")
+    print()
+    print_stats("target_gpu_us     ", gpu_values, "(microseconds)")
     print()
     if interval_values:
         fps_median = 1e6 / percentile(sorted(interval_values), 50)
@@ -237,6 +362,14 @@ def main() -> int:
     target_pct_min = min(pct_values) if pct_values else 0.0
     target_pct_max = max(pct_values) if pct_values else 0.0
 
+    # GPU aggregates over frames with a valid target_gpu_us. gpu_frame_count
+    # == 0 means GPU was not captured (non-D3D11 host); the ms_* lines are
+    # then 0.0000 and every target_gpu_us cell is blank. Matches C++ ComputeStats.
+    gpu_ms_values = [v / 1000.0 for v in gpu_values]
+    target_gpu_ms_mean = statistics.fmean(gpu_ms_values) if gpu_ms_values else 0.0
+    target_gpu_ms_min = min(gpu_ms_values) if gpu_ms_values else 0.0
+    target_gpu_ms_max = max(gpu_ms_values) if gpu_ms_values else 0.0
+
     # newline="" disables the file object's translation; lineterminator='\n'
     # disables csv.writer's default '\r\n'. Together they keep the output
     # LF-only on every platform, matching the C++ merge (binary mode + '\n')
@@ -250,10 +383,15 @@ def main() -> int:
         fh.write(f"# target_pct_mean={target_pct_mean:.4f}%\n")
         fh.write(f"# target_pct_min={target_pct_min:.4f}%\n")
         fh.write(f"# target_pct_max={target_pct_max:.4f}%\n")
+        fh.write(f"# target_gpu_frame_count={len(gpu_values)}\n")
+        fh.write(f"# target_gpu_ms_mean={target_gpu_ms_mean:.4f}\n")
+        fh.write(f"# target_gpu_ms_min={target_gpu_ms_min:.4f}\n")
+        fh.write(f"# target_gpu_ms_max={target_gpu_ms_max:.4f}\n")
         w = csv.writer(fh, lineterminator="\n")
         w.writerow(["frame_idx", "thread_id", "frame_interval_us",
-                    "pre_us", "post_us", "target_us", "target_pct_of_frame"])
-        for fi, tid, fiv, pu, postu, tu, pct in merged:
+                    "pre_us", "post_us", "target_us", "target_pct_of_frame",
+                    "target_gpu_us"])
+        for fi, tid, fiv, pu, postu, tu, pct, gpu in merged:
             w.writerow([
                 fi,
                 tid,
@@ -262,6 +400,7 @@ def main() -> int:
                 f"{postu:.3f}",
                 f"{tu:.3f}",
                 "" if pct is None or math.isnan(pct) else f"{pct:.4f}",
+                "" if gpu is None or math.isnan(gpu) else f"{gpu:.3f}",
             ])
     print(f"wrote {args.out}")
     return 0

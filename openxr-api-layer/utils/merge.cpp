@@ -124,6 +124,44 @@ namespace openxr_api_layer::merge {
         return result;
     }
 
+    ParsedGpuCsv ReadGpuCsv(const std::filesystem::path& path) {
+        ParsedGpuCsv result;
+        result.header_valid = true;  // optimistic; flipped below if violated
+        std::ifstream s(path);
+        if (!s) {
+            // Missing GPU CSV is the NORMAL case on non-D3D11 hosts (no timer
+            // was ever created). Return empty + valid so the caller merges
+            // CPU-only with every target_gpu_us blank.
+            return result;
+        }
+        std::string line;
+        bool header_consumed = false;
+        while (std::getline(s, line)) {
+            if (line.empty()) {
+                continue;
+            }
+            if (line[0] == '#') {
+                continue;  // GPU CSV has no per-file freq; freq is per-row
+            }
+            if (!header_consumed) {
+                if (RTrim(line) != kExpectedGpuColumnHeader) {
+                    result.header_valid = false;
+                    return result;
+                }
+                header_consumed = true;
+                continue;
+            }
+            RawGpuRow r{};
+            char c;
+            std::stringstream ss(line);
+            if (ss >> r.frame_idx >> c >> r.gpu_ticks >> c >> r.gpu_freq >> c >>
+                r.valid) {
+                result.rows.push_back(r);
+            }
+        }
+        return result;
+    }
+
     // preFreq is authoritative for both sides; postFreq is intentionally
     // ignored (matches analyze.py's pre.qpc_freq) -- kept in the signature
     // so callers continue to ferry per-side metadata through, and so a
@@ -205,6 +243,44 @@ namespace openxr_api_layer::merge {
         return merged;
     }
 
+    void JoinGpu(std::vector<MergedRow>& merged,
+                 const std::vector<RawGpuRow>& preGpu,
+                 const std::vector<RawGpuRow>& postGpu) {
+        // Index both sides by frame_idx (GPU rows carry no thread_id; D3D11
+        // submission is single-threaded so frame_idx is a complete key).
+        // operator[] = last-wins on duplicate keys, matching analyze.py's
+        // {r.frame_idx: r for r in rows} dict comprehension.
+        std::map<uint64_t, RawGpuRow> preIdx;
+        std::map<uint64_t, RawGpuRow> postIdx;
+        for (const auto& r : preGpu) {
+            preIdx[r.frame_idx] = r;
+        }
+        for (const auto& r : postGpu) {
+            postIdx[r.frame_idx] = r;
+        }
+        for (auto& m : merged) {
+            const auto p = preIdx.find(m.frame_idx);
+            const auto q = postIdx.find(m.frame_idx);
+            if (p == preIdx.end() || q == postIdx.end()) {
+                continue;  // no GPU sample on one or both sides
+            }
+            const RawGpuRow& pre = p->second;
+            const RawGpuRow& post = q->second;
+            if (pre.valid == 0 || post.valid == 0) {
+                continue;  // disjoint clock / zero frequency on a side
+            }
+            if (pre.gpu_freq == 0 || pre.gpu_freq != post.gpu_freq) {
+                continue;  // clock frequency changed across the span
+            }
+            if (post.gpu_ticks < pre.gpu_ticks) {
+                continue;  // backwards counter (driver bug) -- don't wrap
+            }
+            const uint64_t deltaTicks = post.gpu_ticks - pre.gpu_ticks;
+            m.target_gpu_us = static_cast<double>(deltaTicks) /
+                              static_cast<double>(pre.gpu_freq) * 1e6;
+        }
+    }
+
     namespace {
 
         // Kahan-Neumaier compensated summation. Naive `s += v` loses ~ulp
@@ -239,8 +315,10 @@ namespace openxr_api_layer::merge {
         }
         std::vector<double> ms_values;
         std::vector<double> pct_values;
+        std::vector<double> gpu_ms_values;
         ms_values.reserve(merged.size());
         pct_values.reserve(merged.size());
+        gpu_ms_values.reserve(merged.size());
         for (const auto& m : merged) {
             const double ms = m.target_us / 1000.0;
             ms_values.push_back(ms);
@@ -249,6 +327,9 @@ namespace openxr_api_layer::merge {
             }
             if (m.target_pct_of_frame.has_value()) {
                 pct_values.push_back(*m.target_pct_of_frame);
+            }
+            if (m.target_gpu_us.has_value()) {
+                gpu_ms_values.push_back(*m.target_gpu_us / 1000.0);
             }
         }
         // ms_values always non-empty because merged is non-empty.
@@ -263,6 +344,17 @@ namespace openxr_api_layer::merge {
             stats.target_pct_max =
                 *std::max_element(pct_values.begin(), pct_values.end());
         }
+        // GPU aggregates over frames that have a valid target_gpu_us. Stays
+        // zero (and gpu_frame_count == 0) on CPU-only sessions.
+        stats.gpu_frame_count = gpu_ms_values.size();
+        if (!gpu_ms_values.empty()) {
+            stats.target_gpu_ms_mean =
+                KahanNeumaierSum(gpu_ms_values) / gpu_ms_values.size();
+            stats.target_gpu_ms_min =
+                *std::min_element(gpu_ms_values.begin(), gpu_ms_values.end());
+            stats.target_gpu_ms_max =
+                *std::max_element(gpu_ms_values.begin(), gpu_ms_values.end());
+        }
         return stats;
     }
 
@@ -276,8 +368,12 @@ namespace openxr_api_layer::merge {
             << "# target_pct_mean=" << fmt::format("{:.4f}", stats.target_pct_mean) << "%\n"
             << "# target_pct_min="  << fmt::format("{:.4f}", stats.target_pct_min)  << "%\n"
             << "# target_pct_max="  << fmt::format("{:.4f}", stats.target_pct_max)  << "%\n"
+            << "# target_gpu_frame_count=" << stats.gpu_frame_count << '\n'
+            << "# target_gpu_ms_mean=" << fmt::format("{:.4f}", stats.target_gpu_ms_mean) << '\n'
+            << "# target_gpu_ms_min="  << fmt::format("{:.4f}", stats.target_gpu_ms_min)  << '\n'
+            << "# target_gpu_ms_max="  << fmt::format("{:.4f}", stats.target_gpu_ms_max)  << '\n'
             << "frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,"
-               "target_pct_of_frame\n";
+               "target_pct_of_frame,target_gpu_us\n";
         for (const auto& m : merged) {
             out << m.frame_idx << ',' << m.thread_id << ',';
             if (m.frame_interval_us.has_value()) {
@@ -288,6 +384,10 @@ namespace openxr_api_layer::merge {
                 << fmt::format("{:.3f}", m.target_us) << ',';
             if (m.target_pct_of_frame.has_value()) {
                 out << fmt::format("{:.4f}", *m.target_pct_of_frame);
+            }
+            out << ',';
+            if (m.target_gpu_us.has_value()) {
+                out << fmt::format("{:.3f}", *m.target_gpu_us);
             }
             out << '\n';
         }
