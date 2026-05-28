@@ -88,10 +88,13 @@
 #include <memory>
 #include <vector>
 
-// ID3D11Device is forward-declared rather than #included so this header stays
-// cheap to include from the merge/test translation units that never touch D3D.
-// The implementation (gpu_timer.cpp) pulls the real d3d11.h via pch.h.
+// ID3D11Device / ID3D12Device / ID3D12CommandQueue are forward-declared rather
+// than #included so this header stays cheap to include from the merge/test
+// translation units that never touch D3D. The implementation (gpu_timer.cpp)
+// pulls the real d3d11.h / d3d12.h via pch.h.
 struct ID3D11Device;
+struct ID3D12Device;
+struct ID3D12CommandQueue;
 
 namespace openxr_api_layer::gpu {
 
@@ -259,7 +262,20 @@ namespace openxr_api_layer::gpu {
         // user knows when a session's GPU timeline has gaps it cannot
         // attribute. Monotonic; reset only by destroying the timer (i.e. on
         // xrDestroySession, when a new instance is built on next create).
+        //
+        // D3D11 overwrites the in-flight query and counts the dropped frame;
+        // D3D12 instead SKIPS the new frame (D3D12 forbids resetting a
+        // command allocator while its commands execute) but bumps the same
+        // counter -- user-visible behaviour is identical: one frame's GPU
+        // sample is missing, the merge leaves target_gpu_us blank.
         virtual uint64_t DroppedFrames() const = 0;
+
+        // Lowercase identifier of the active backend ("d3d11", "d3d12").
+        // Written into the GPU CSV's "# gpu_clock=" header line so the
+        // user can tell at a glance which API produced the timestamps.
+        // Returned as a static string -- safe to read from the writer
+        // thread without ownership transfer.
+        virtual const char* BackendName() const = 0;
     };
 
     // Build a D3D11 GPU timer on `device` (the app's ID3D11Device pulled from
@@ -268,5 +284,19 @@ namespace openxr_api_layer::gpu {
     // CPU-only session (gpu_timer stays null, no GPU rows are written, and the
     // merge leaves target_gpu_us blank). Never throws.
     std::unique_ptr<IGpuTimer> MakeD3D11GpuTimer(ID3D11Device* device);
+
+    // Build a D3D12 GPU timer on the app's (device, command_queue) pair
+    // pulled from XrGraphicsBindingD3D12KHR in xrCreateSession. The queue
+    // MUST be of type D3D12_COMMAND_LIST_TYPE_DIRECT (the OpenXR spec
+    // requires this for the app's render queue) -- a compute / copy queue
+    // is refused at init. Returns nullptr on any creation failure (query
+    // heap, readback buffer, allocators, command lists, fence); the caller
+    // degrades to CPU-only the same way as for D3D11.
+    //
+    // Submits one tiny command list per frame to `command_queue` (an
+    // EndQuery + ResolveQueryData), so the GPU work added to the app's
+    // queue is essentially free (no draws, no transitions).
+    std::unique_ptr<IGpuTimer> MakeD3D12GpuTimer(ID3D12Device* device,
+                                                 ID3D12CommandQueue* command_queue);
 
 } // namespace openxr_api_layer::gpu

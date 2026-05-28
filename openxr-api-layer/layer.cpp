@@ -709,9 +709,20 @@ namespace openxr_api_layer {
             static constexpr const char* kFilePrefix = "gpu";
             static void WriteHeader(std::ostream& s) {
                 // No qpc_freq line: the GPU clock frequency is per-row (it
-                // comes from each D3D11 disjoint query), so it lives in the
-                // gpu_freq column rather than a single file-level header.
-                s << "# gpu_clock=d3d11\n"
+                // comes from the active backend's clock source -- D3D11
+                // disjoint query, D3D12 GetTimestampFrequency() at init),
+                // so it lives in the gpu_freq column rather than a single
+                // file-level header.
+                //
+                // The "gpu_clock" line carries the backend name pulled from
+                // g_gpuTimer at write time. The writer thread only reaches
+                // this code after at least one PollResolved emitted a row,
+                // which implies g_gpuTimer was non-null and remains so for
+                // the rest of the session (xrDestroySession runs on the
+                // frame thread and cannot race xrEndFrame).
+                const char* backend =
+                    g_gpuTimer ? g_gpuTimer->BackendName() : "unknown";
+                s << "# gpu_clock=" << backend << "\n"
                   << "# side=" << kSideStr << "\n"
                   << "# layer=" << LayerName << "\n"
                   << "# fn=xrEndFrame\n"
@@ -754,15 +765,31 @@ namespace openxr_api_layer {
 
         // Walks an XrBaseInStructure-style `next` chain for the first
         // XrGraphicsBindingD3D11KHR. Returns nullptr if the app uses a
-        // different graphics API (D3D12 / Vulkan / OpenGL) -- the caller then
-        // runs the session CPU-only. We rely on the common-initial-sequence
-        // layout (XrStructureType type; const void* next) shared by every
-        // OpenXR `next` struct.
+        // different graphics API -- the caller then tries the D3D12 binding
+        // (see FindD3D12Binding below) before falling back to CPU-only. We
+        // rely on the common-initial-sequence layout (XrStructureType type;
+        // const void* next) shared by every OpenXR `next` struct.
         const XrGraphicsBindingD3D11KHR* FindD3D11Binding(const void* next) {
             for (auto* base = reinterpret_cast<const XrBaseInStructure*>(next);
                  base != nullptr; base = base->next) {
                 if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
                     return reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(base);
+                }
+            }
+            return nullptr;
+        }
+
+        // Same walk for XrGraphicsBindingD3D12KHR. The struct carries an
+        // ID3D12Device* AND an ID3D12CommandQueue* (D3D12 has no immediate
+        // context -- the app submits commands to a queue it owns), so the
+        // GPU timer needs BOTH handles: device to create the query heap +
+        // command lists + fence, queue to ExecuteCommandLists onto the
+        // same stream the app draws on.
+        const XrGraphicsBindingD3D12KHR* FindD3D12Binding(const void* next) {
+            for (auto* base = reinterpret_cast<const XrBaseInStructure*>(next);
+                 base != nullptr; base = base->next) {
+                if (base->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
+                    return reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(base);
                 }
             }
             return nullptr;
@@ -1146,7 +1173,7 @@ namespace openxr_api_layer {
                                             GetCurrentProcessId(), kSideStr))
                     .string()));
             Log(fmt::format(
-                "GPU timings (D3D11 hosts only) will be written to: {}\n",
+                "GPU timings (D3D11 / D3D12 hosts) will be written to: {}\n",
                 (localAppData / fmt::format("gpu-{}-{}.csv",
                                             GetCurrentProcessId(), kSideStr))
                     .string()));
@@ -1208,8 +1235,8 @@ namespace openxr_api_layer {
             // one timer's query objects alive at a time.
             g_gpuTimer.reset();
 
-            if (const auto* binding = FindD3D11Binding(createInfo->next)) {
-                g_gpuTimer = gpu::MakeD3D11GpuTimer(binding->device);
+            if (const auto* d3d11 = FindD3D11Binding(createInfo->next)) {
+                g_gpuTimer = gpu::MakeD3D11GpuTimer(d3d11->device);
                 if (g_gpuTimer) {
                     Log(fmt::format(
                         "GPU timer active (D3D11) on side='{}'\n", kSideStr));
@@ -1217,8 +1244,19 @@ namespace openxr_api_layer {
                     Log("D3D11 binding present but GPU query creation failed; "
                         "target_gpu_us will be blank for this session\n");
                 }
+            } else if (const auto* d3d12 = FindD3D12Binding(createInfo->next)) {
+                g_gpuTimer = gpu::MakeD3D12GpuTimer(d3d12->device, d3d12->queue);
+                if (g_gpuTimer) {
+                    Log(fmt::format(
+                        "GPU timer active (D3D12) on side='{}'\n", kSideStr));
+                } else {
+                    Log("D3D12 binding present but GPU query heap / fence / "
+                        "command-list creation failed (or the queue is not a "
+                        "DIRECT queue); target_gpu_us will be blank for this "
+                        "session\n");
+                }
             } else {
-                Log("No D3D11 binding in xrCreateSession (D3D12 / Vulkan / "
+                Log("No D3D11 or D3D12 binding in xrCreateSession (Vulkan / "
                     "OpenGL host); GPU monitoring off, CPU monitoring active\n");
             }
             return result;
