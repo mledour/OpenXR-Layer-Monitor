@@ -82,6 +82,8 @@
 //     between the two sides IS caught and blanks the frame.
 // =============================================================================
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -92,6 +94,122 @@
 struct ID3D11Device;
 
 namespace openxr_api_layer::gpu {
+
+    namespace detail {
+
+        // Slot states for the GPU query ring. Lives outside GpuSlotRing so a
+        // test (or a future backend) can name the values without instantiating
+        // the template.
+        enum class SlotState { Idle, Pending };
+
+        // Fixed-capacity, single-thread state machine for the GPU query ring.
+        // Tracks Pending vs Idle per slot and exposes overwrite-on-full
+        // semantics + oldest-first drain order. Holds NO D3D objects -- the
+        // concrete backend (GpuTimerD3D11) keeps its query handles in a
+        // parallel std::array<...QueryPair, N> and uses the indices returned
+        // here to drive its actual Begin/End/GetData calls. Extracted out of
+        // GpuTimerD3D11 specifically so the tricky overwrite-on-full path
+        // (gpu_timer.cpp Reserve()) can be unit-tested without a D3D11 device.
+        //
+        // Thread model: every method runs on the app's render thread, the
+        // same thread that owns the D3D11 immediate context. No internal
+        // synchronisation -- callers MUST NOT touch the ring from any other
+        // thread.
+        template <std::size_t N>
+        class GpuSlotRing {
+            static_assert(N > 0, "GpuSlotRing capacity must be positive");
+
+          public:
+            struct ReserveResult {
+                // Index of the slot we reserved (caller writes its query data
+                // into m_querySlots[slot_index] in the backend).
+                std::size_t slot_index;
+                // True iff the slot we reused was still Pending -- the GPU
+                // hadn't caught up before we wrapped around. Caller increments
+                // its dropped-frames counter on true.
+                bool overwrote_pending;
+            };
+
+            // Reserve the next write slot for `frame_idx`, mark Pending,
+            // advance the write cursor. On a full ring, overwrites the oldest
+            // pending slot and bumps the read cursor past the dropped entry
+            // so PollResolved never sees a freshly-overwritten slot as the
+            // "next" frame.
+            ReserveResult Reserve(uint64_t frame_idx) {
+                const bool overwriting =
+                    (m_ring[m_writeIdx].state == SlotState::Pending);
+                const std::size_t reserved = m_writeIdx;
+                m_ring[m_writeIdx].frame_index = frame_idx;
+                m_ring[m_writeIdx].state = SlotState::Pending;
+                m_writeIdx = (m_writeIdx + 1) % N;
+                if (overwriting) {
+                    // In a full ring, after the advance, the new write index
+                    // points at the next-oldest pending slot -- which IS the
+                    // new oldest. The read cursor tracks that.
+                    m_readIdx = m_writeIdx;
+                }
+                return {reserved, overwriting};
+            }
+
+            // Look at the oldest Pending slot without consuming it. Returns
+            // false if no slot is Pending (the empty case).
+            bool PeekOldest(std::size_t& slot_index,
+                            uint64_t& frame_idx) const {
+                if (m_ring[m_readIdx].state != SlotState::Pending) {
+                    return false;
+                }
+                slot_index = m_readIdx;
+                frame_idx = m_ring[m_readIdx].frame_index;
+                return true;
+            }
+
+            // Mark the oldest Pending slot Idle and advance the read cursor.
+            // Precondition: PeekOldest just returned true (i.e. there IS an
+            // oldest Pending slot). Used both for the success path and to
+            // drop a slot whose GetData came back malformed.
+            void ConsumeOldest() {
+                m_ring[m_readIdx].state = SlotState::Idle;
+                m_readIdx = (m_readIdx + 1) % N;
+            }
+
+            // Drop every Pending slot and reset both cursors. Called on a
+            // fresh monitoring session (Ctrl+F9) so stale slots tagged with
+            // the previous session's frame_idx numbering cannot resolve into
+            // the just-truncated CSV.
+            void Reset() {
+                for (auto& s : m_ring) {
+                    s.state = SlotState::Idle;
+                    s.frame_index = 0;
+                }
+                m_writeIdx = 0;
+                m_readIdx = 0;
+            }
+
+            // Test-only inspectors (used by test_gpu_ring.cpp; production
+            // callers go through Reserve / PeekOldest / ConsumeOldest / Reset
+            // exclusively). Both are const and inlinable, so leaving them in
+            // the public API has zero cost in release.
+            std::size_t WriteIndex() const { return m_writeIdx; }
+            std::size_t ReadIndex() const { return m_readIdx; }
+            SlotState SlotStateAt(std::size_t i) const {
+                return m_ring[i].state;
+            }
+            uint64_t FrameIndexAt(std::size_t i) const {
+                return m_ring[i].frame_index;
+            }
+            static constexpr std::size_t Capacity() { return N; }
+
+          private:
+            struct Slot {
+                uint64_t frame_index = 0;
+                SlotState state = SlotState::Idle;
+            };
+            std::array<Slot, N> m_ring{};
+            std::size_t m_writeIdx = 0;
+            std::size_t m_readIdx = 0;
+        };
+
+    } // namespace detail
 
     // One row of gpu-<pid>-<side>.csv, produced by PollResolved and written by
     // the GPU CSV sink. valid == 0 means the timestamp is unusable for this
@@ -134,6 +252,14 @@ namespace openxr_api_layer::gpu {
         // PREVIOUS session's frame_idx numbering cannot resolve into the new
         // (truncated, frame_idx-reset-to-0) CSV.
         virtual void Reset() = 0;
+
+        // Cumulative count of frames the backend dropped because the GPU was
+        // more than the ring's capacity behind on readback (a >~44 ms stall
+        // at 90 Hz, kGpuRingSize=4). Surfaced in the GPU CSV footer so the
+        // user knows when a session's GPU timeline has gaps it cannot
+        // attribute. Monotonic; reset only by destroying the timer (i.e. on
+        // xrDestroySession, when a new instance is built on next create).
+        virtual uint64_t DroppedFrames() const = 0;
     };
 
     // Build a D3D11 GPU timer on `device` (the app's ID3D11Device pulled from

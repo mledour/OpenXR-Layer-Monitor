@@ -555,7 +555,14 @@ namespace openxr_api_layer {
                     if (open_failed) {
                         return false;
                     }
-                    stream.open(path, std::ios::out | std::ios::trunc);
+                    // Binary mode keeps line endings LF-only on every platform.
+                    // Traits::WriteHeader / Traits::WriteRow emit '\n' literally;
+                    // without binary mode MSVC translates to "\r\n" and the per-
+                    // side CSVs end up CRLF on Windows / LF elsewhere.
+                    // MergeIntoOutput's ofstream uses the same flag for the same
+                    // reason -- keep them in sync.
+                    stream.open(path,
+                                std::ios::out | std::ios::trunc | std::ios::binary);
                     if (!stream) {
                         ErrorLog(fmt::format("Failed to open {}\n",
                                              path.string()));
@@ -603,13 +610,15 @@ namespace openxr_api_layer {
                         if (stream.is_open()) {
                             stream.flush();
                         }
-                        // Footer: surface drop counts so the user knows
-                        // if the ring overflowed during the session.
-                        // Quiet when zero so the common case stays clean.
+                        // Footer: each Traits decides what end-of-session
+                        // diagnostics to emit. CPU sink writes the queue-
+                        // overflow count; GPU sink ALSO surfaces its timer's
+                        // ring-overwrite count (the GPU readback ring is
+                        // independent of this CSV ring). Quiet when there's
+                        // nothing to say so a clean session stays clean.
                         const auto drops = DroppedQueueFull();
-                        if (drops > 0 && ensureOpen()) {
-                            stream << "# session_end dropped_queue_full="
-                                   << drops << "\n";
+                        if (Traits::HasFooter(drops) && ensureOpen()) {
+                            Traits::WriteFooter(stream, drops);
                             stream.flush();
                         }
                         return;
@@ -666,7 +675,35 @@ namespace openxr_api_layer {
                 s << r.frame_idx << ',' << r.thread_id << ','
                   << r.qpc_entry << ',' << r.qpc_exit << '\n';
             }
+            // The CPU sink's only end-of-session diagnostic is the SPSC ring
+            // overflow count -- emitted only when non-zero so a clean session
+            // produces a clean CSV.
+            static bool HasFooter(uint64_t droppedQueueFull) {
+                return droppedQueueFull > 0;
+            }
+            static void WriteFooter(std::ostream& s, uint64_t droppedQueueFull) {
+                s << "# session_end dropped_queue_full=" << droppedQueueFull << "\n";
+            }
         };
+
+        // Per-DLL singleton GPU timer, recreated on each xrCreateSession and
+        // released on each xrDestroySession. Null on non-D3D11 hosts or if
+        // query creation failed. Only ever touched from the frame thread (the
+        // D3D11 immediate context is single-threaded), so a plain unique_ptr
+        // is sufficient -- no atomic. xrCreateSession happens-before the
+        // first xrEndFrame via the app's own handoff of the XrSession handle.
+        // Declared HERE (before GpuCsvTraits) so the GPU sink's footer code
+        // can read DroppedFrames() inline.
+        //
+        // SAME SINGLE-SESSION ASSUMPTION AS THE SPSC RING ABOVE: an app that
+        // holds two XrSession handles open concurrently on the same DLL would
+        // see them share this timer. The OpenXR spec allows this in theory,
+        // but every shipping host we know of -- including OpenComposite's
+        // probe-then-real pattern -- destroys the previous session before
+        // creating the next, which IS the case xrCreateSession's `reset()`
+        // below handles. A truly concurrent-session host would have to either
+        // refuse the second session or upgrade this to a per-session map.
+        std::unique_ptr<gpu::IGpuTimer> g_gpuTimer;
 
         struct GpuCsvTraits {
             static constexpr const char* kFilePrefix = "gpu";
@@ -684,6 +721,29 @@ namespace openxr_api_layer {
                 s << r.frame_idx << ',' << r.gpu_ticks << ','
                   << r.gpu_freq << ',' << r.valid << '\n';
             }
+            // GPU sink surfaces TWO independent drop sources at end of
+            // session: the SPSC CSV-ring overflow (same as the CPU sink, ~45
+            // s of disk stall at 90 Hz to fill), AND the GPU TIMER's own
+            // ring-overwrite count (g_gpuTimer->DroppedFrames(), bumped when
+            // GPU readback is >kGpuRingSize frames behind, i.e. a >~44 ms
+            // GPU stall). Read here on the writer thread; the writer-thread
+            // join inside CsvSink::Stop() pairs with the render-thread
+            // relaxed fetch_add to publish the final value.
+            static uint64_t GpuRingOverflow() {
+                return g_gpuTimer ? g_gpuTimer->DroppedFrames() : 0;
+            }
+            static bool HasFooter(uint64_t droppedQueueFull) {
+                return droppedQueueFull > 0 || GpuRingOverflow() > 0;
+            }
+            static void WriteFooter(std::ostream& s, uint64_t droppedQueueFull) {
+                if (droppedQueueFull > 0) {
+                    s << "# session_end dropped_queue_full=" << droppedQueueFull << "\n";
+                }
+                const uint64_t overwritten = GpuRingOverflow();
+                if (overwritten > 0) {
+                    s << "# session_end gpu_ring_overflow=" << overwritten << "\n";
+                }
+            }
         };
 
         using FrameCsvSink = CsvSink<FrameRow, FrameCsvTraits>;
@@ -691,14 +751,6 @@ namespace openxr_api_layer {
 
         FrameCsvSink g_csv;
         GpuCsvSink g_gpuCsv;
-
-        // The per-session D3D11 GPU timer (null on non-D3D11 hosts or if
-        // query creation failed). Created in xrCreateSession, released in
-        // xrDestroySession, and only ever touched from the frame thread (the
-        // D3D11 immediate context is single-threaded) -- so a plain
-        // unique_ptr, not an atomic. xrCreateSession happens-before the first
-        // xrEndFrame via the app's own handoff of the XrSession handle.
-        std::unique_ptr<gpu::IGpuTimer> g_gpuTimer;
 
         // Walks an XrBaseInStructure-style `next` chain for the first
         // XrGraphicsBindingD3D11KHR. Returns nullptr if the app uses a

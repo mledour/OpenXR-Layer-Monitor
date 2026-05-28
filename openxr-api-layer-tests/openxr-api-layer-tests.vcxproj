@@ -136,6 +136,7 @@
     <ClCompile Include="main.cpp" />
     <ClCompile Include="test_example.cpp" />
     <ClCompile Include="test_merge.cpp" />
+    <ClCompile Include="test_gpu_ring.cpp" />
     <ClCompile Include="test_integration.cpp" />
     <ClCompile Include="mock_runtime.cpp" />
     <ClCompile Include="test_stubs.cpp" />

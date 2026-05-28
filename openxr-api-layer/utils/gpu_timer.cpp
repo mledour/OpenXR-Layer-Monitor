@@ -24,6 +24,7 @@
 
 #include "gpu_timer.h"
 
+#include <atomic>
 #include <array>
 
 namespace openxr_api_layer::gpu {
@@ -36,8 +37,6 @@ namespace openxr_api_layer::gpu {
         // XrTelemetry uses for its duration timer.
         constexpr size_t kGpuRingSize = 4;
 
-        enum class SlotState { Idle, Pending };
-
         // D3D11 backend: one D3D11_QUERY_TIMESTAMP wrapped in its own tiny
         // D3D11_QUERY_TIMESTAMP_DISJOINT bracket, per ring slot. RecordTimestamp
         // issues Begin(disjoint) / End(timestamp) / End(disjoint) as a unit at
@@ -49,12 +48,17 @@ namespace openxr_api_layer::gpu {
         // GPU span live in two different DLLs (pre records the start, post the
         // end). Each side can only place ONE marker; the subtraction happens
         // offline in the merge. So a slot here holds one timestamp, not two.
+        //
+        // Ring bookkeeping (Pending/Idle indexing, overwrite-on-full) lives in
+        // detail::GpuSlotRing<N> (gpu_timer.h) so the tricky path is unit-
+        // testable without a D3D11 device. This class is just the D3D plumbing
+        // around it.
         class GpuTimerD3D11 final : public IGpuTimer {
           public:
             ~GpuTimerD3D11() override {
-                for (auto& slot : m_ring) {
-                    slot.disjoint.Reset();
-                    slot.timestamp.Reset();
+                for (auto& pair : m_querySlots) {
+                    pair.disjoint.Reset();
+                    pair.timestamp.Reset();
                 }
                 m_context.Reset();
                 m_device.Reset();
@@ -81,24 +85,22 @@ namespace openxr_api_layer::gpu {
 
                 const D3D11_QUERY_DESC disjointDesc{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
                 const D3D11_QUERY_DESC tsDesc{D3D11_QUERY_TIMESTAMP, 0};
-                for (auto& slot : m_ring) {
+                for (auto& pair : m_querySlots) {
                     if (FAILED(m_device->CreateQuery(&disjointDesc,
-                                                     slot.disjoint.GetAddressOf())) ||
+                                                     pair.disjoint.GetAddressOf())) ||
                         FAILED(m_device->CreateQuery(&tsDesc,
-                                                     slot.timestamp.GetAddressOf()))) {
-                        for (auto& s : m_ring) {
-                            s.disjoint.Reset();
-                            s.timestamp.Reset();
+                                                     pair.timestamp.GetAddressOf()))) {
+                        for (auto& p : m_querySlots) {
+                            p.disjoint.Reset();
+                            p.timestamp.Reset();
                         }
                         m_context.Reset();
                         m_device.Reset();
                         return false;
                     }
-                    slot.state = SlotState::Idle;
-                    slot.frame_index = 0;
                 }
-                m_writeIdx = 0;
-                m_readIdx = 0;
+                m_ring.Reset();
+                m_droppedFrames.store(0, std::memory_order_relaxed);
                 m_active = true;
                 return true;
             }
@@ -107,25 +109,18 @@ namespace openxr_api_layer::gpu {
                 if (!m_active) {
                     return;
                 }
-                Slot& slot = m_ring[m_writeIdx];
-                // If the slot we're about to reuse is still Pending, the ring
-                // is full: the GPU is more than kGpuRingSize frames behind on
-                // readback (a severe stall). We overwrite the oldest unresolved
-                // slot and pull the consumer's read cursor forward so it never
-                // reads freshly-overwritten data as the dropped frame. The
-                // dropped frame simply gets no GPU row; the merge tolerates it.
-                const bool overwritingPending = (slot.state == SlotState::Pending);
-
-                m_context->Begin(slot.disjoint.Get());
-                m_context->End(slot.timestamp.Get());
-                m_context->End(slot.disjoint.Get());
-                slot.frame_index = frame_idx;
-                slot.state = SlotState::Pending;
-
-                m_writeIdx = (m_writeIdx + 1) % kGpuRingSize;
-                if (overwritingPending) {
-                    m_readIdx = m_writeIdx;
+                // Reserve a ring slot. On a full ring (GPU >kGpuRingSize
+                // frames behind, a >~44 ms stall at 90 Hz) the oldest
+                // unresolved entry is silently overwritten -- we bump the
+                // drop counter so the GPU CSV footer can surface it.
+                const auto reserved = m_ring.Reserve(frame_idx);
+                if (reserved.overwrote_pending) {
+                    m_droppedFrames.fetch_add(1, std::memory_order_relaxed);
                 }
+                auto& pair = m_querySlots[reserved.slot_index];
+                m_context->Begin(pair.disjoint.Get());
+                m_context->End(pair.timestamp.Get());
+                m_context->End(pair.disjoint.Get());
             }
 
             void PollResolved(std::vector<GpuRow>& out) override {
@@ -133,17 +128,19 @@ namespace openxr_api_layer::gpu {
                     return;
                 }
                 // Drain oldest-first. GPU timestamps complete in command-stream
-                // (FIFO) order, so if the slot at m_readIdx isn't ready yet,
-                // nothing behind it is either -- we stop and retry next poll,
-                // preserving frame order in the CSV.
+                // (FIFO) order, so if the slot at the read cursor isn't ready
+                // yet, nothing behind it is either -- we stop and retry next
+                // poll, preserving frame order in the CSV.
                 while (true) {
-                    Slot& slot = m_ring[m_readIdx];
-                    if (slot.state != SlotState::Pending) {
+                    std::size_t slot_index = 0;
+                    uint64_t frame_idx = 0;
+                    if (!m_ring.PeekOldest(slot_index, frame_idx)) {
                         break;
                     }
+                    auto& pair = m_querySlots[slot_index];
                     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData{};
                     const HRESULT hr =
-                        m_context->GetData(slot.disjoint.Get(), &disjointData,
+                        m_context->GetData(pair.disjoint.Get(), &disjointData,
                                            sizeof(disjointData),
                                            D3D11_ASYNC_GETDATA_DONOTFLUSH);
                     if (hr != S_OK) {
@@ -151,15 +148,14 @@ namespace openxr_api_layer::gpu {
                     }
                     UINT64 ticks = 0;
                     const HRESULT hrTs =
-                        m_context->GetData(slot.timestamp.Get(), &ticks,
+                        m_context->GetData(pair.timestamp.Get(), &ticks,
                                            sizeof(ticks),
                                            D3D11_ASYNC_GETDATA_DONOTFLUSH);
                     if (hrTs != S_OK) {
                         // The disjoint query went ready but the paired
                         // timestamp did not -- not expected from a conformant
                         // driver. Drop the slot rather than stall the ring.
-                        slot.state = SlotState::Idle;
-                        m_readIdx = (m_readIdx + 1) % kGpuRingSize;
+                        m_ring.ConsumeOldest();
                         continue;
                     }
                     // The Disjoint flag and Frequency both live on the disjoint
@@ -170,10 +166,9 @@ namespace openxr_api_layer::gpu {
                         (!disjointData.Disjoint && disjointData.Frequency != 0)
                             ? 1u
                             : 0u;
-                    out.push_back(GpuRow{slot.frame_index, ticks,
+                    out.push_back(GpuRow{frame_idx, ticks,
                                          disjointData.Frequency, valid});
-                    slot.state = SlotState::Idle;
-                    m_readIdx = (m_readIdx + 1) % kGpuRingSize;
+                    m_ring.ConsumeOldest();
                 }
             }
 
@@ -182,31 +177,46 @@ namespace openxr_api_layer::gpu {
                     return;
                 }
                 // Abandon every in-flight slot. Re-issuing Begin on a query
-                // that was End'd but never read is well-defined in D3D11 (the
-                // stale result is discarded), so no GPU calls are needed here
-                // -- this is pure CPU bookkeeping, safe to call from the frame
-                // thread inside ApplyToggle.
-                for (auto& slot : m_ring) {
-                    slot.state = SlotState::Idle;
-                    slot.frame_index = 0;
-                }
-                m_writeIdx = 0;
-                m_readIdx = 0;
+                // that was End'd but never read back via GetData is well-
+                // defined in D3D11: per the ID3D11DeviceContext::Begin docs,
+                // "calling Begin on a query that has been previously issued
+                // [...] will start a new query". The stale, never-read result
+                // is simply discarded by the runtime, so we do NOT need any
+                // GPU-side cleanup here -- this is pure CPU bookkeeping, safe
+                // to call from the frame thread inside ApplyToggle.
+                // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-begin
+                m_ring.Reset();
+            }
+
+            uint64_t DroppedFrames() const override {
+                // Acquire matches the producer's relaxed fetch_add: the
+                // happens-before edge that publishes the final counter value
+                // to the GPU CSV writer thread is the writer's join inside
+                // CsvSink::Stop(), but stating acquire here makes the
+                // contract explicit for non-x86 readers.
+                return m_droppedFrames.load(std::memory_order_acquire);
             }
 
           private:
-            struct Slot {
+            // A ring slot's D3D11 objects. The Pending/Idle state and frame
+            // index sit in m_ring (detail::GpuSlotRing); this struct only
+            // carries the query handles we hand to the immediate context.
+            struct QuerySlot {
                 ComPtr<ID3D11Query> disjoint;
                 ComPtr<ID3D11Query> timestamp;
-                uint64_t frame_index = 0;
-                SlotState state = SlotState::Idle;
             };
 
             ComPtr<ID3D11Device> m_device;
             ComPtr<ID3D11DeviceContext> m_context;
-            std::array<Slot, kGpuRingSize> m_ring;
-            size_t m_writeIdx = 0;
-            size_t m_readIdx = 0;
+            std::array<QuerySlot, kGpuRingSize> m_querySlots;
+            detail::GpuSlotRing<kGpuRingSize> m_ring;
+            // Bumped each time RecordTimestamp overwrites a Pending slot
+            // (ring full -> GPU stall longer than kGpuRingSize frames).
+            // Read from the writer thread inside the GPU CSV footer; written
+            // from the render thread. Relaxed RMW since there's nothing else
+            // to publish alongside it -- the acquire on DroppedFrames() and
+            // the writer-thread join in Stop() give the cross-thread fence.
+            std::atomic<uint64_t> m_droppedFrames{0};
             bool m_active = false;
         };
 
