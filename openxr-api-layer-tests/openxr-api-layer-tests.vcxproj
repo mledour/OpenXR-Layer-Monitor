@@ -153,9 +153,9 @@
     <ClCompile Include="..\openxr-api-layer\utils\merge.cpp" />
     <!-- gpu_timer.cpp defines MakeD3D11GpuTimer, which layer.cpp's
          xrCreateSession references. Without it the test binary's link step
-         fails with LNK2019 -- the layer.dll project links fine because IT
+         fails with LNK2019: the layer DLL project links fine because IT
          already includes gpu_timer.cpp, but the test binary builds its own
-         link unit. -->
+         link unit, so we add the entry here too. -->
     <ClCompile Include="..\openxr-api-layer\utils\gpu_timer.cpp" />
   </ItemGroup>
   <ItemGroup>
