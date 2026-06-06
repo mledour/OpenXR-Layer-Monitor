@@ -38,7 +38,7 @@ namespace openxr_api_layer::merge {
 
     // One row of a per-side frames-<pid>-{pre,post}.csv, parsed from disk.
     struct RawFrameRow {
-        uint64_t frame_idx;
+        uint64_t display_time;
         uint32_t thread_id;
         int64_t qpc_entry;
         int64_t qpc_exit;
@@ -48,9 +48,9 @@ namespace openxr_api_layer::merge {
     // valid == 0 means the timestamp is unusable for this frame (the D3D11
     // disjoint query reported Disjoint, or frequency came back 0); JoinGpu
     // skips any frame whose pre OR post row is invalid. Not thread-tagged:
-    // D3D11 GPU submission is single-threaded, so frame_idx alone is the key.
+    // D3D11 GPU submission is single-threaded, so display_time alone is the key.
     struct RawGpuRow {
-        uint64_t frame_idx;
+        uint64_t display_time;
         uint64_t gpu_ticks;
         uint64_t gpu_freq;
         uint32_t valid;
@@ -62,7 +62,7 @@ namespace openxr_api_layer::merge {
     //
     // header_valid = false flags the "user pointed us at a merged CSV by
     // mistake" case (or any other file whose column-header line is not
-    // exactly `frame_idx,thread_id,qpc_entry,qpc_exit`). Callers should
+    // exactly `display_time,thread_id,qpc_entry,qpc_exit`). Callers should
     // refuse to merge such input rather than silently producing zero
     // matched rows. The Python analyzer enforces the same contract via
     // a SystemExit with the same error wording.
@@ -87,11 +87,11 @@ namespace openxr_api_layer::merge {
     // Expected raw per-side CSV column header, exactly. Any deviation
     // (including the 8-column merged-CSV header) is rejected.
     inline constexpr const char* kExpectedColumnHeader =
-        "frame_idx,thread_id,qpc_entry,qpc_exit";
+        "display_time,thread_id,qpc_entry,qpc_exit";
 
     // Expected per-side GPU CSV column header, exactly.
     inline constexpr const char* kExpectedGpuColumnHeader =
-        "frame_idx,gpu_ticks,gpu_freq,valid";
+        "display_time,gpu_ticks,gpu_freq,valid";
 
     // One row of the merged CSV. Optionals are blanked out when undefined:
     //   frame_interval_us / target_pct_of_frame -> last frame per thread (no
@@ -99,7 +99,7 @@ namespace openxr_api_layer::merge {
     //   target_gpu_us -> no GPU row on one/both sides for this frame, an
     //       invalid GPU sample, or a GPU clock mismatch (see JoinGpu).
     struct MergedRow {
-        uint64_t frame_idx;
+        uint64_t display_time;
         uint32_t thread_id;
         std::optional<double> frame_interval_us;
         double pre_us;
@@ -137,7 +137,7 @@ namespace openxr_api_layer::merge {
 
     // Returns rows = {} and qpc_freq = defaultFreq if the file is missing,
     // unreadable, or has a malformed header. The column header row
-    // (`frame_idx,thread_id,qpc_entry,qpc_exit`) is recognised and skipped;
+    // (`display_time,thread_id,qpc_entry,qpc_exit`) is recognised and skipped;
     // mis-named columns or extra trailing data is silently ignored at the
     // row level (truncated parse).
     ParsedFrameCsv ReadFrameCsv(const std::filesystem::path& path,
@@ -150,13 +150,13 @@ namespace openxr_api_layer::merge {
     // skipped silently (truncated parse), matching ReadFrameCsv.
     ParsedGpuCsv ReadGpuCsv(const std::filesystem::path& path);
 
-    // Joins preRows + postRows by (frame_idx, thread_id), computes
+    // Joins preRows + postRows by (display_time, thread_id), computes
     // target_us = pre_bracket - post_bracket, derives frame_interval_us
     // from pre.qpc_entry deltas (per thread), and sets target_pct_of_frame
-    // accordingly. Result is sorted by (thread_id, frame_idx) for
+    // accordingly. Result is sorted by (thread_id, display_time) for
     // deterministic CSV output. Rows missing from either side are dropped.
     //
-    // Each (frame_idx, thread_id) post entry is CONSUMED on match (like
+    // Each (display_time, thread_id) post entry is CONSUMED on match (like
     // analyze.py's post_index.pop), so duplicate pre keys do not double-
     // count against the same post entry -- output row count equals number
     // of matched pairs, never more.
@@ -177,12 +177,12 @@ namespace openxr_api_layer::merge {
         const std::vector<RawFrameRow>& postRows, int64_t postFreq);
 
     // Fills target_gpu_us on each MergedRow by joining preGpu + postGpu on
-    // frame_idx (GPU rows carry no thread_id). For a given frame:
+    // display_time (GPU rows carry no thread_id). For a given frame:
     //
     //   target_gpu_us = (post.gpu_ticks - pre.gpu_ticks) / pre.gpu_freq * 1e6
     //
     // left BLANK (target_gpu_us stays nullopt) unless ALL of:
-    //   * a GPU row exists on BOTH sides for that frame_idx,
+    //   * a GPU row exists on BOTH sides for that display_time,
     //   * both rows are valid (valid != 0),
     //   * pre.gpu_freq == post.gpu_freq and is non-zero (a frequency change
     //     between the two timestamps means the GPU clock was disjoint across
@@ -191,7 +191,7 @@ namespace openxr_api_layer::merge {
     //     bug; treating the unsigned wrap as a huge delta would poison stats).
     //
     // Must run BEFORE ComputeStats so the GPU aggregates see the populated
-    // target_gpu_us values. Mutates `merged` in place. Duplicate frame_idx in
+    // target_gpu_us values. Mutates `merged` in place. Duplicate display_time in
     // either GPU input resolves last-wins (matches analyze.py's dict join).
     void JoinGpu(std::vector<MergedRow>& merged,
                  const std::vector<RawGpuRow>& preGpu,

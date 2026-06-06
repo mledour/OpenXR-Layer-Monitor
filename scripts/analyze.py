@@ -20,18 +20,18 @@ Math:
     frame_interval_us = pre_entry[i+1] - pre_entry[i]      (per thread)
     target_pct_of_frame = target_us / frame_interval_us * 100
     target_gpu_us     = (gpu_post_ticks - gpu_pre_ticks) / gpu_freq * 1e6
-                        (joined by frame_idx; blank unless both GPU rows are
+                        (joined by display_time; blank unless both GPU rows are
                          valid, share a frequency, and post_ticks >= pre_ticks)
 
-Output columns (one row per matched frame, sorted by thread then frame_idx):
-    frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,
+Output columns (one row per matched frame, sorted by thread then display_time):
+    display_time,thread_id,frame_interval_us,pre_us,post_us,target_us,
     target_pct_of_frame,target_gpu_us
 
 The last frame per thread has no successor, so frame_interval_us and
 target_pct_of_frame are left blank for that row. target_gpu_us is blank for
 any frame without a valid GPU sample on both sides.
 
-Rows are paired by (frame_idx, thread_id). Mismatched counts are reported
+Rows are paired by (display_time, thread_id). Mismatched counts are reported
 as warnings and the script joins on the common subset.
 """
 from __future__ import annotations
@@ -45,21 +45,21 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-RAW_COLUMNS = ("frame_idx", "thread_id", "qpc_entry", "qpc_exit")
-GPU_COLUMNS = ("frame_idx", "gpu_ticks", "gpu_freq", "valid")
+RAW_COLUMNS = ("display_time", "thread_id", "qpc_entry", "qpc_exit")
+GPU_COLUMNS = ("display_time", "gpu_ticks", "gpu_freq", "valid")
 
 
 @dataclass
 class Frames:
     side: str
     qpc_freq: int
-    rows: list[tuple[int, int, int, int]]  # frame_idx, thread_id, qpc_entry, qpc_exit
+    rows: list[tuple[int, int, int, int]]  # display_time, thread_id, qpc_entry, qpc_exit
 
 
 @dataclass
 class GpuFrames:
     side: str
-    rows: list[tuple[int, int, int, int]]  # frame_idx, gpu_ticks, gpu_freq, valid
+    rows: list[tuple[int, int, int, int]]  # display_time, gpu_ticks, gpu_freq, valid
 
 
 def load(path: Path) -> Frames:
@@ -79,7 +79,7 @@ def load(path: Path) -> Frames:
             if not header_found:
                 # The raw per-side CSV has exactly four columns. A user
                 # passing the merged CSV by mistake (seven columns,
-                # starts with frame_idx,thread_id,frame_interval_us...)
+                # starts with display_time,thread_id,frame_interval_us...)
                 # would otherwise crash with an obscure ValueError on
                 # int("11100.000"). Catch it here with a clear message.
                 if tuple(raw) != RAW_COLUMNS:
@@ -170,7 +170,7 @@ def gpu_target_us(
 ) -> float | None:
     """target_gpu_us for one frame, or None if it can't be computed.
 
-    Blank (None) unless BOTH sides have a row for this frame_idx, both are
+    Blank (None) unless BOTH sides have a row for this display_time, both are
     valid, the frequencies match and are non-zero, and post_ticks >=
     pre_ticks. Mirrors the C++ JoinGpu guards exactly.
     """
@@ -249,7 +249,7 @@ def main() -> int:
         print(f"warning: qpc_freq mismatch pre={pre.qpc_freq} post={post.qpc_freq} -- using pre",
               file=sys.stderr)
 
-    # Index GPU rows by frame_idx (GPU rows carry no thread_id; D3D11 GPU
+    # Index GPU rows by display_time (GPU rows carry no thread_id; D3D11 GPU
     # submission is single-threaded). last-wins on duplicate keys, matching
     # the C++ std::map[key] = r join.
     gpu_pre_idx: dict[int, tuple[int, int, int]] = {}
@@ -306,7 +306,7 @@ def main() -> int:
                 frame_interval_us = fiv
                 target_pct = target_us / fiv * 100.0
 
-        # GPU join by frame_idx -- blank when no valid GPU sample on both
+        # GPU join by display_time -- blank when no valid GPU sample on both
         # sides. Matches the C++ JoinGpu guards.
         target_gpu = gpu_target_us(fi, gpu_pre_idx, gpu_post_idx)
 
@@ -322,7 +322,7 @@ def main() -> int:
         print("error: no rows matched -- check the input files", file=sys.stderr)
         return 1
 
-    # Sort for deterministic output: by thread, then frame_idx.
+    # Sort for deterministic output: by thread, then display_time.
     merged.sort(key=lambda r: (r[1], r[0]))
 
     target_values = [r[5] for r in merged]
@@ -388,7 +388,7 @@ def main() -> int:
         fh.write(f"# target_gpu_ms_min={target_gpu_ms_min:.4f}\n")
         fh.write(f"# target_gpu_ms_max={target_gpu_ms_max:.4f}\n")
         w = csv.writer(fh, lineterminator="\n")
-        w.writerow(["frame_idx", "thread_id", "frame_interval_us",
+        w.writerow(["display_time", "thread_id", "frame_interval_us",
                     "pre_us", "post_us", "target_us", "target_pct_of_frame",
                     "target_gpu_us"])
         for fi, tid, fiv, pu, postu, tu, pct, gpu in merged:

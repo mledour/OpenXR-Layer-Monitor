@@ -32,7 +32,7 @@ def write_raw_csv(path: Path, side: str, qpc_freq: int,
         fh.write(f"# side={side}\n")
         fh.write(f"# layer=XR_APILAYER_MLEDOUR_layer_monitor_{side}\n")
         fh.write("# fn=xrEndFrame\n")
-        fh.write("frame_idx,thread_id,qpc_entry,qpc_exit\n")
+        fh.write("display_time,thread_id,qpc_entry,qpc_exit\n")
         for fi, tid, qe, qx in rows:
             fh.write(f"{fi},{tid},{qe},{qx}\n")
 
@@ -41,7 +41,7 @@ def write_gpu_csv(path: Path, side: str,
                   rows: list[tuple[int, int, int, int]]) -> None:
     """Mirror layer.cpp's GpuCsvSink output format.
 
-    Rows: (frame_idx, gpu_ticks, gpu_freq, valid). No file-level frequency
+    Rows: (display_time, gpu_ticks, gpu_freq, valid). No file-level frequency
     header -- gpu_freq lives in the per-row column (each disjoint query
     reports its own clock rate at submission time).
     """
@@ -50,7 +50,7 @@ def write_gpu_csv(path: Path, side: str,
         fh.write(f"# side={side}\n")
         fh.write(f"# layer=XR_APILAYER_MLEDOUR_layer_monitor_{side}\n")
         fh.write("# fn=xrEndFrame\n")
-        fh.write("frame_idx,gpu_ticks,gpu_freq,valid\n")
+        fh.write("display_time,gpu_ticks,gpu_freq,valid\n")
         for fi, ticks, freq, valid in rows:
             fh.write(f"{fi},{ticks},{freq},{valid}\n")
 
@@ -221,7 +221,7 @@ def test_end_to_end_lf_only_line_endings(tmp_path: Path) -> None:
 # ----------------------------------------------------------------------------
 
 def test_no_matched_frames_exits_nonzero(tmp_path: Path) -> None:
-    """Two non-empty files but with disjoint (frame_idx, thread_id) keys.
+    """Two non-empty files but with disjoint (display_time, thread_id) keys.
 
     The C++ merge logs a warning and skips the write; the Python script
     exits with code 1 and a clear error. Both refuse to write garbage.
@@ -256,16 +256,16 @@ def test_last_frame_per_thread_has_blank_interval_and_pct(tmp_path: Path) -> Non
     assert rc == 0
     text = (tmp_path / "frames-merged-1.csv").read_text(encoding="utf-8")
 
-    # Sort order produced by analyze.py is (thread_id, frame_idx):
+    # Sort order produced by analyze.py is (thread_id, display_time):
     #   row 0 = thread 1, frame 0  (has successor on thread 1)
     #   row 1 = thread 1, frame 1  (no successor on thread 1)
     #   row 2 = thread 2, frame 0  (only frame on thread 2)
-    # Columns: frame_idx, thread_id, frame_interval_us, pre_us, post_us,
+    # Columns: display_time, thread_id, frame_interval_us, pre_us, post_us,
     #          target_us, target_pct_of_frame.
     rows = [
         line.split(",")
         for line in text.splitlines()
-        if line and not line.startswith("#") and not line.startswith("frame_idx")
+        if line and not line.startswith("#") and not line.startswith("display_time")
     ]
     assert len(rows) == 3
 
@@ -304,7 +304,7 @@ def test_multiple_threads_sort_by_thread_then_frame(tmp_path: Path) -> None:
     assert rc == 0
     text = (tmp_path / "frames-merged-7.csv").read_text(encoding="utf-8")
     data = [l for l in text.splitlines()
-            if l and not l.startswith("#") and not l.startswith("frame_idx")]
+            if l and not l.startswith("#") and not l.startswith("display_time")]
     assert len(data) == 4
     # (thread 1 frame 0), (thread 1 frame 3), (thread 2 frame 0), (thread 2 frame 5)
     keys = [tuple(map(int, row.split(",")[:2])) for row in data]
@@ -333,7 +333,7 @@ def _data_rows(text: str) -> list[list[str]]:
     return [
         line.split(",")
         for line in text.splitlines()
-        if line and not line.startswith("#") and not line.startswith("frame_idx")
+        if line and not line.startswith("#") and not line.startswith("display_time")
     ]
 
 
@@ -368,7 +368,7 @@ def test_gpu_join_populates_target_gpu_us_when_files_present(tmp_path: Path) -> 
     text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
 
     # Column header gained the target_gpu_us column.
-    assert "frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us," \
+    assert "display_time,thread_id,frame_interval_us,pre_us,post_us,target_us," \
            "target_pct_of_frame,target_gpu_us\n" in text
 
     # GPU stats over the two valid samples (5 us + 8 us = 13 us; mean 6.5 us

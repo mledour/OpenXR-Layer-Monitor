@@ -64,7 +64,7 @@
 // Each backend keeps a small ring (kGpuRingSize) of in-flight slots;
 // PollResolved() drains every slot whose GPU result is ready and emits one
 // GpuRow per resolved frame. The CSV is therefore a few frames behind the
-// CPU CSV at any instant, which the merge tolerates (it joins on frame_idx and
+// CPU CSV at any instant, which the merge tolerates (it joins on display_time and
 // leaves target_gpu_us blank for any frame missing a GPU row on either side).
 //
 // THREADING
@@ -154,16 +154,16 @@ namespace openxr_api_layer::gpu {
                 bool overwrote_pending;
             };
 
-            // Reserve the next write slot for `frame_idx`, mark Pending,
+            // Reserve the next write slot for `display_time`, mark Pending,
             // advance the write cursor. On a full ring, overwrites the oldest
             // pending slot and bumps the read cursor past the dropped entry
             // so PollResolved never sees a freshly-overwritten slot as the
             // "next" frame.
-            ReserveResult Reserve(uint64_t frame_idx) {
+            ReserveResult Reserve(uint64_t display_time) {
                 const bool overwriting =
                     (m_ring[m_writeIdx].state == SlotState::Pending);
                 const std::size_t reserved = m_writeIdx;
-                m_ring[m_writeIdx].frame_index = frame_idx;
+                m_ring[m_writeIdx].frame_index = display_time;
                 m_ring[m_writeIdx].state = SlotState::Pending;
                 m_writeIdx = (m_writeIdx + 1) % N;
                 if (overwriting) {
@@ -178,12 +178,12 @@ namespace openxr_api_layer::gpu {
             // Look at the oldest Pending slot without consuming it. Returns
             // false if no slot is Pending (the empty case).
             bool PeekOldest(std::size_t& slot_index,
-                            uint64_t& frame_idx) const {
+                            uint64_t& display_time) const {
                 if (m_ring[m_readIdx].state != SlotState::Pending) {
                     return false;
                 }
                 slot_index = m_readIdx;
-                frame_idx = m_ring[m_readIdx].frame_index;
+                display_time = m_ring[m_readIdx].frame_index;
                 return true;
             }
 
@@ -198,7 +198,7 @@ namespace openxr_api_layer::gpu {
 
             // Drop every Pending slot and reset both cursors. Called on a
             // fresh monitoring session (Ctrl+F9) so stale slots tagged with
-            // the previous session's frame_idx numbering cannot resolve into
+            // the previous session's display_time numbering cannot resolve into
             // the just-truncated CSV.
             void Reset() {
                 for (auto& s : m_ring) {
@@ -242,7 +242,7 @@ namespace openxr_api_layer::gpu {
     // invalid. gpu_ticks is the raw GPU counter value; gpu_freq is the clock
     // rate from the disjoint query (ticks per second).
     struct GpuRow {
-        uint64_t frame_idx;
+        uint64_t display_time;
         uint64_t gpu_ticks;
         uint64_t gpu_freq;
         uint32_t valid;
@@ -258,11 +258,11 @@ namespace openxr_api_layer::gpu {
         virtual ~IGpuTimer() = default;
 
         // Insert one GPU timestamp into the command stream at the current
-        // point, tagging it with frame_idx so PollResolved can pair it back to
+        // point, tagging it with display_time so PollResolved can pair it back to
         // the CPU row later. Overwrites the oldest ring slot if the ring is
         // full (a multi-frame GPU stall) -- the dropped frame simply gets no
         // GPU row, which the merge tolerates.
-        virtual void RecordTimestamp(uint64_t frame_idx) = 0;
+        virtual void RecordTimestamp(uint64_t display_time) = 0;
 
         // Drain every slot whose GPU result is ready and append one GpuRow per
         // resolved frame to `out` (oldest first). Non-blocking: a slot whose
@@ -273,8 +273,8 @@ namespace openxr_api_layer::gpu {
 
         // Drop all in-flight slots without resolving them. Called when a fresh
         // monitoring session starts (Ctrl+F9) so timestamps recorded under the
-        // PREVIOUS session's frame_idx numbering cannot resolve into the new
-        // (truncated, frame_idx-reset-to-0) CSV.
+        // PREVIOUS session's display_time numbering cannot resolve into the new
+        // (truncated, display_time-reset-to-0) CSV.
         virtual void Reset() = 0;
 
         // Count of frames the backend dropped IN THE CURRENT SESSION because

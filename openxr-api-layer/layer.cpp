@@ -45,7 +45,7 @@
 //      <base> is the shared folder (suffix _pre/_post stripped in entry.cpp).
 //
 // Offline (or via a small consumer) the two CSVs / two ETW streams are merged
-// by (pid, thread_id, frame_idx) and target_cpu is computed per frame.
+// by (pid, thread_id, display_time) and target_cpu is computed per frame.
 //
 // IMPORTANT: never call Log() from xrEndFrame -- see framework/log.h's banner
 // about the DBWinMutex trap that drops frames on some compositors. The
@@ -312,7 +312,14 @@ namespace openxr_api_layer {
         // target layers.
 
         struct FrameRow {
-            uint64_t frame_idx;
+            // The frame's predicted display time (XrFrameEndInfo::displayTime,
+            // an XrTime). Both halves of the sandwich observe the SAME value
+            // for a given host frame, so it is the intrinsic key the merge
+            // joins on -- unlike a per-DLL counter, it cannot desync when the
+            // layer ordering or a one-sided start throws the two sides out of
+            // step. Stored as uint64_t (XrTime is non-negative in practice) so
+            // the merge keys and the GPU ring need no signed/unsigned churn.
+            uint64_t display_time;
             uint32_t thread_id;
             int64_t qpc_entry;
             int64_t qpc_exit;
@@ -669,10 +676,10 @@ namespace openxr_api_layer {
                   << "# side=" << kSideStr << "\n"
                   << "# layer=" << LayerName << "\n"
                   << "# fn=xrEndFrame\n"
-                  << "frame_idx,thread_id,qpc_entry,qpc_exit\n";
+                  << "display_time,thread_id,qpc_entry,qpc_exit\n";
             }
             static void WriteRow(std::ostream& s, const FrameRow& r) {
-                s << r.frame_idx << ',' << r.thread_id << ','
+                s << r.display_time << ',' << r.thread_id << ','
                   << r.qpc_entry << ',' << r.qpc_exit << '\n';
             }
             // The CPU sink's only end-of-session diagnostic is the SPSC ring
@@ -759,10 +766,10 @@ namespace openxr_api_layer {
                   << "# side=" << kSideStr << "\n"
                   << "# layer=" << LayerName << "\n"
                   << "# fn=xrEndFrame\n"
-                  << "frame_idx,gpu_ticks,gpu_freq,valid\n";
+                  << "display_time,gpu_ticks,gpu_freq,valid\n";
             }
             static void WriteRow(std::ostream& s, const gpu::GpuRow& r) {
-                s << r.frame_idx << ',' << r.gpu_ticks << ','
+                s << r.display_time << ',' << r.gpu_ticks << ','
                   << r.gpu_freq << ',' << r.valid << '\n';
             }
             // GPU sink surfaces TWO independent drop sources at end of
@@ -932,8 +939,9 @@ namespace openxr_api_layer {
             auto merged = merge::ComputeMerge(
                 pre.rows, pre.qpc_freq, post.rows, post.qpc_freq);
             if (merged.empty()) {
-                Log("Skipping auto-merge: no matched (frame_idx, thread_id) "
-                    "pairs between pre and post\n");
+                Log("Skipping auto-merge: no matched (display_time, thread_id) "
+                    "pairs between pre and post (does a layer between pre and "
+                    "post rewrite frameEndInfo->displayTime?)\n");
                 removeStale();
                 return;
             }
@@ -1065,9 +1073,9 @@ namespace openxr_api_layer {
                     return;
                 }
                 // Drop any GPU slots still in flight from a PREVIOUS session:
-                // they were tagged with that session's frame_idx numbering and
+                // they were tagged with that session's display_time values and
                 // would otherwise resolve into the just-truncated GPU CSV under
-                // the new session's frame 0..N. Also resets the per-session
+                // the new session's frames. Also resets the per-session
                 // drop counter so the new session's footer reports only its
                 // own overflow count. Safe on the frame thread (no other
                 // thread touches the timer's ring / counter; D3D11 path is
@@ -1370,7 +1378,7 @@ namespace openxr_api_layer {
         // of the function, qpc_exit just before the Append call. So
         // post.bracket includes nearly everything post does -- including
         // its observe / skipNext / monitoring overhead, the runtime call,
-        // the frame_idx increment, and the TraceLoggingWrite. When pre
+        // the g_frameCounter increment, and the TraceLoggingWrite. When pre
         // subtracts post.bracket, all of that cancels out, leaving
         // target_us = target_layer's actual work + the lock-free
         // ring.Push call (the only thing post does AFTER qpc_exit). With
@@ -1416,8 +1424,17 @@ namespace openxr_api_layer {
                 if (!g_monitoring.load(std::memory_order_acquire)) {
                     return OpenXrApi::xrEndFrame(session, frameEndInfo);
                 }
+                // We key the frame on frameEndInfo->displayTime below; a null
+                // frameEndInfo is an app validation error the runtime will
+                // reject. Pass it through unrecorded rather than dereferencing
+                // null. Both halves forward the same (possibly null) pointer
+                // down the chain, so neither records and the two sides stay
+                // aligned.
+                if (!frameEndInfo) {
+                    return OpenXrApi::xrEndFrame(session, frameEndInfo);
+                }
 
-                // frame_idx + GPU marker BEFORE the narrow bracket. The GPU
+                // display_time + GPU marker BEFORE the narrow bracket. The GPU
                 // RecordTimestamp's cost is backend-dependent (a few D3D11
                 // immediate-context Begin/End calls, ~100 ns; or a D3D12
                 // command-list Reset + EndQuery + ResolveQueryData + Close
@@ -1425,16 +1442,20 @@ namespace openxr_api_layer {
                 // sequence) -- either way that work is pre's OWN overhead
                 // and MUST stay OUTSIDE the bracket. Inside it would inflate
                 // pre.bracket and bias target_us by the GPU-instrumentation
-                // cost. T_pre marks the command stream as the last GPU
-                // event before the target's draws. frame_idx is fetched
-                // here so the GPU row and the CPU row below share the same
-                // index (the merge joins GPU pre<->post and GPU<->CPU on
-                // frame_idx).
-                const uint64_t frame_idx =
-                    g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+                // cost. T_pre marks the command stream as the last GPU event
+                // before the target's draws. displayTime is read here so the
+                // GPU row and the CPU row below share the same key (the merge
+                // joins GPU pre<->post and GPU<->CPU on display_time).
+                // g_frameCounter still advances, but only to feed
+                // MergeIntoOutput's zero-frame guard ("did this session record
+                // anything?"); it is no longer the CSV key, so the two sides'
+                // counters drifting apart can no longer corrupt the join.
+                const uint64_t display_time =
+                    static_cast<uint64_t>(frameEndInfo->displayTime);
+                g_frameCounter.fetch_add(1, std::memory_order_relaxed);
                 const uint32_t thread_id = GetCurrentThreadId();
                 if (g_gpuTimer) {
-                    g_gpuTimer->RecordTimestamp(frame_idx);
+                    g_gpuTimer->RecordTimestamp(display_time);
                 }
 
                 // Narrow bracket -- pre's own work is OUTSIDE.
@@ -1446,11 +1467,11 @@ namespace openxr_api_layer {
                 TraceLoggingWrite(g_traceProvider,
                                   "xrEndFrame",
                                   TLArg(kSideStr, "Side"),
-                                  TLArg(frame_idx, "FrameIdx"),
+                                  TLArg(display_time, "DisplayTime"),
                                   TLArg(qpc_entry, "QpcEntry"),
                                   TLArg(qpc_exit, "QpcExit"),
                                   TLArg(qpc_exit - qpc_entry, "QpcDelta"));
-                g_csv.Append({frame_idx, thread_id, qpc_entry, qpc_exit});
+                g_csv.Append({display_time, thread_id, qpc_entry, qpc_exit});
 
                 // Drain resolved GPU timestamps AFTER qpc_exit (outside the
                 // narrow bracket) so the GetData polls never inflate target_us.
@@ -1484,18 +1505,27 @@ namespace openxr_api_layer {
                 if (!g_monitoring.load(std::memory_order_acquire)) {
                     return OpenXrApi::xrEndFrame(session, frameEndInfo);
                 }
+                // Same null guard as pre: we key on frameEndInfo->displayTime
+                // below, and both halves forward the same (possibly null)
+                // pointer down the chain, so neither records the frame.
+                if (!frameEndInfo) {
+                    return OpenXrApi::xrEndFrame(session, frameEndInfo);
+                }
 
-                // frame_idx + GPU marker INSIDE the wide bracket (before the
+                // display_time + GPU marker INSIDE the wide bracket (before the
                 // runtime call). Both cancel in the pre-minus-post subtraction,
                 // so they add no bias to target_us. T_post marks the command
                 // stream right after the target's draws and before the
                 // runtime/compositor's GPU work, so (T_post - T_pre) brackets
-                // exactly the target's GPU work.
-                const uint64_t frame_idx =
-                    g_frameCounter.fetch_add(1, std::memory_order_relaxed);
+                // exactly the target's GPU work. displayTime is the intrinsic
+                // per-frame key both sides agree on; g_frameCounter advances
+                // only to feed MergeIntoOutput's zero-frame guard.
+                const uint64_t display_time =
+                    static_cast<uint64_t>(frameEndInfo->displayTime);
+                g_frameCounter.fetch_add(1, std::memory_order_relaxed);
                 const uint32_t thread_id = GetCurrentThreadId();
                 if (g_gpuTimer) {
-                    g_gpuTimer->RecordTimestamp(frame_idx);
+                    g_gpuTimer->RecordTimestamp(display_time);
                     // Drain INSIDE the bracket too: the GetData polls then
                     // cancel in the subtraction rather than becoming residual
                     // target_us bias (they would otherwise sit after qpc_exit).
@@ -1511,11 +1541,11 @@ namespace openxr_api_layer {
                 // cost is itself absorbed by post.bracket). Real exit
                 // timestamps land in the CSV; consumers wanting WPA-side
                 // delta correlation should join the ETW stream to the
-                // CSV by (Side, FrameIdx).
+                // CSV by (Side, DisplayTime).
                 TraceLoggingWrite(g_traceProvider,
                                   "xrEndFrame",
                                   TLArg(kSideStr, "Side"),
-                                  TLArg(frame_idx, "FrameIdx"),
+                                  TLArg(display_time, "DisplayTime"),
                                   TLArg(qpc_entry, "QpcEntry"));
 
                 // qpc_exit AS LATE AS POSSIBLE so post.bracket subsumes
@@ -1523,7 +1553,7 @@ namespace openxr_api_layer {
                 // are the ring.Push below (~20 ns) and the function
                 // return (~5 ns).
                 const int64_t qpc_exit = Qpc();
-                g_csv.Append({frame_idx, thread_id, qpc_entry, qpc_exit});
+                g_csv.Append({display_time, thread_id, qpc_entry, qpc_exit});
                 return result;
             }
         }
