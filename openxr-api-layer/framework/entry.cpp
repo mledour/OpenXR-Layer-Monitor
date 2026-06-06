@@ -80,12 +80,37 @@ XrResult __declspec(dllexport) XRAPI_CALL
                 break;
             }
         }
-        localAppData = std::filesystem::path(getenv("LOCALAPPDATA")) / baseName;
+        // %LOCALAPPDATA% is unset for some identities the loader can run
+        // us under -- SYSTEM services and sandboxed AppContainers (WebXR
+        // in Chrome, OpenXR Tools for WMR). getenv() then returns nullptr,
+        // and std::filesystem::path(nullptr) is undefined behavior that
+        // would crash the host inside loader negotiation. Resolve a
+        // writable base defensively: %LOCALAPPDATA% when present, else the
+        // per-identity temp directory (GetTempPath yields a writable path
+        // even for a restricted token). If neither resolves, leave
+        // localAppData empty so downstream file I/O degrades to a no-op
+        // rather than taking down the host process.
+        std::filesystem::path writableBase;
+        if (const char* const localAppDataEnv = getenv("LOCALAPPDATA");
+            localAppDataEnv && *localAppDataEnv) {
+            writableBase = std::filesystem::path(localAppDataEnv);
+        } else {
+            char tempPath[MAX_PATH + 1];
+            if (const DWORD len = GetTempPathA(sizeof(tempPath), tempPath);
+                len > 0 && len < sizeof(tempPath)) {
+                writableBase = std::filesystem::path(tempPath);
+            }
+        }
+        if (!writableBase.empty()) {
+            localAppData = writableBase / baseName;
+        }
     }
-    CreateDirectoryA(localAppData.string().c_str(), nullptr);
+    if (!localAppData.empty()) {
+        CreateDirectoryA(localAppData.string().c_str(), nullptr);
+    }
 
     // Start logging to file.
-    if (!logStream.is_open()) {
+    if (!logStream.is_open() && !localAppData.empty()) {
         std::string logFile = (localAppData / (LayerName + ".log")).string();
         logStream.open(logFile, std::ios_base::ate);
     }
