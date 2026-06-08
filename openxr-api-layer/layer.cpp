@@ -809,6 +809,28 @@ namespace openxr_api_layer {
         FrameCsvSink g_csv;
         GpuCsvSink g_gpuCsv;
 
+        // One-shot, best-effort drain of any GPU timestamps the timer has
+        // ALREADY resolved, into the GPU CSV sink. Called at stop / teardown
+        // right before g_gpuCsv.Stop(): the per-frame DrainGpu() runs at
+        // different points on pre (after qpc_exit) vs post (inside the
+        // bracket), so at stop each side can still be holding a few resolved
+        // samples the writer never picked up -- without this they are dropped
+        // and the last frames' target_gpu_us go blank. Off the hot path, so a
+        // local buffer is fine (unlike the per-frame DrainGpu's reused scratch).
+        // Frames the GPU has NOT finished yet are not recovered (that would
+        // need a blocking fence wait); the resolved tail is. No-op on a null
+        // timer (Vulkan / OpenGL host).
+        void DrainResolvedGpuOnce() {
+            if (!g_gpuTimer) {
+                return;
+            }
+            std::vector<gpu::GpuRow> resolved;
+            g_gpuTimer->PollResolved(resolved);
+            for (const auto& row : resolved) {
+                g_gpuCsv.Append(row);
+            }
+        }
+
         // Walks an XrBaseInStructure-style `next` chain for the first
         // XrGraphicsBindingD3D11KHR. Returns nullptr if the app uses a
         // different graphics API -- the caller then tries the D3D12 binding
@@ -1118,6 +1140,9 @@ namespace openxr_api_layer {
                 }
             } else {
                 g_csv.Stop();     // noexcept; catches its own join exceptions
+                // Recover any GPU timestamps the timer resolved but the
+                // per-frame drain never picked up, before closing the sink.
+                DrainResolvedGpuOnce();
                 g_gpuCsv.Stop();  // noexcept; flush the GPU CSV before merge
                 if constexpr (kIsPostSide) {
                     // Post is downstream, so by the time we reach this
@@ -1199,6 +1224,7 @@ namespace openxr_api_layer {
                 return;
             }
             g_csv.Stop();     // noexcept
+            DrainResolvedGpuOnce();  // recover the resolved GPU tail before closing
             g_gpuCsv.Stop();  // noexcept; flush GPU CSV before the merge reads it
             if constexpr (kIsPostSide) {
                 try {
