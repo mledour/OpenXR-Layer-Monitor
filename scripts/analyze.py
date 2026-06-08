@@ -82,6 +82,18 @@ def _parse_int4(raw: list[str]) -> tuple[int, int, int, int] | None:
         return None
 
 
+def _summarize(values: list[float]) -> tuple[float, float, float]:
+    """(mean, min, max) over values, or (0.0, 0.0, 0.0) when empty.
+
+    Mirrors merge.cpp's Summarize() -- a single source for the reduction so a
+    change cannot drift between the ms / pct / gpu stat groups, keeping the
+    merged-CSV header byte-equivalent regardless of which path produced it.
+    """
+    if not values:
+        return (0.0, 0.0, 0.0)
+    return (statistics.fmean(values), min(values), max(values))
+
+
 def load(path: Path) -> Frames:
     meta: dict[str, str] = {}
     rows: list[tuple[int, int, int, int]] = []
@@ -401,20 +413,14 @@ def main() -> int:
     # the last frame per thread (no successor -> no interval -> no pct),
     # matching the C++ merge.
     target_ms_values = [v / 1000.0 for v in target_values]
-    target_ms_mean = statistics.fmean(target_ms_values) if target_ms_values else 0.0
-    target_ms_min = min(target_ms_values) if target_ms_values else 0.0
-    target_ms_max = max(target_ms_values) if target_ms_values else 0.0
-    target_pct_mean = statistics.fmean(pct_values) if pct_values else 0.0
-    target_pct_min = min(pct_values) if pct_values else 0.0
-    target_pct_max = max(pct_values) if pct_values else 0.0
+    target_ms_mean, target_ms_min, target_ms_max = _summarize(target_ms_values)
+    target_pct_mean, target_pct_min, target_pct_max = _summarize(pct_values)
 
     # GPU aggregates over frames with a valid target_gpu_us. gpu_frame_count
     # == 0 means GPU was not captured (non-D3D11 host); the ms_* lines are
     # then 0.0000 and every target_gpu_us cell is blank. Matches C++ ComputeStats.
     gpu_ms_values = [v / 1000.0 for v in gpu_values]
-    target_gpu_ms_mean = statistics.fmean(gpu_ms_values) if gpu_ms_values else 0.0
-    target_gpu_ms_min = min(gpu_ms_values) if gpu_ms_values else 0.0
-    target_gpu_ms_max = max(gpu_ms_values) if gpu_ms_values else 0.0
+    target_gpu_ms_mean, target_gpu_ms_min, target_gpu_ms_max = _summarize(gpu_ms_values)
 
     # newline="" disables the file object's translation; lineterminator='\n'
     # disables csv.writer's default '\r\n'. Together they keep the output
