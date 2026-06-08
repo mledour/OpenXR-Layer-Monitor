@@ -836,10 +836,11 @@ namespace openxr_api_layer {
         //
         // Thin wrapper around utils/merge.cpp's pure functions. This is the
         // OS-facing glue: resolves the three paths under localAppData,
-        // applies the data-preservation policies (zero-frame guard +
-        // removeStale on the no-matching-rows path), and opens the
-        // ofstream in binary mode so the LF '\n' characters emitted by
-        // WriteMergedCsv survive MSVC's text-mode translation.
+        // applies the data-preservation policy (zero-frame guard + a
+        // write-to-temp-then-atomic-rename so a failed merge never destroys
+        // the previous session's output), and opens the temp ofstream in
+        // binary mode so the LF '\n' characters emitted by WriteMergedCsv
+        // survive MSVC's text-mode translation.
         //
         // All actual parsing, joining, stats, and formatting lives in
         // utils/merge.cpp where it can be unit-tested independently.
@@ -880,16 +881,18 @@ namespace openxr_api_layer {
                 return;
             }
 
-            // removeStale is now safe to call unconditionally on the
-            // no-rows / no-matches / open-fail paths: passing the zero-
-            // frame guard above proves THIS session has data of its own
-            // about to be written, so any pre-existing merged file at
-            // this PID is from an earlier session of THIS process (which
-            // the current session has just superseded).
-            const auto removeStale = [&] {
-                std::error_code ec;
-                std::filesystem::remove(outCsv, ec);
-            };
+            // DATA-LOSS POLICY: the previous session's frames-merged-<pid>.csv
+            // is preserved through EVERY failure path below. The new merge is
+            // written to a sibling temp file and atomically renamed over the
+            // destination only once a complete, valid file exists (bottom of
+            // this function). The earlier code deleted the destination eagerly
+            // on the error paths AND opened it in truncate mode before the
+            // write, so a session that recorded frames but then failed
+            // transiently (a per-side CSV that never flushed, ENOSPC, a lost
+            // ACL) destroyed a still-valid merged CSV and left nothing behind.
+            // A stale-but-valid file from an earlier session beats no file --
+            // and matches what the zero-frame guard above already does; the
+            // logs below tell the user the merge was skipped.
 
             // Default qpc_freq matches analyze.py (10 MHz) rather than the
             // local machine's QpcFreqHz(). In production both halves write
@@ -907,7 +910,6 @@ namespace openxr_api_layer {
                     "Pre CSV has unexpected column header at {}: did you "
                     "point a merged-CSV here by mistake?\n",
                     preCsv.string()));
-                removeStale();
                 return;
             }
             if (!post.header_valid) {
@@ -915,14 +917,12 @@ namespace openxr_api_layer {
                     "Post CSV has unexpected column header at {}: did you "
                     "point a merged-CSV here by mistake?\n",
                     postCsv.string()));
-                removeStale();
                 return;
             }
             if (pre.rows.empty() || post.rows.empty()) {
                 Log(fmt::format(
                     "Skipping auto-merge: pre={} rows, post={} rows\n",
                     pre.rows.size(), post.rows.size()));
-                removeStale();
                 return;
             }
 
@@ -942,7 +942,6 @@ namespace openxr_api_layer {
                 Log("Skipping auto-merge: no matched (display_time, thread_id) "
                     "pairs between pre and post (does a layer between pre and "
                     "post rewrite frameEndInfo->displayTime?)\n");
-                removeStale();
                 return;
             }
 
@@ -976,30 +975,54 @@ namespace openxr_api_layer {
                     stats.negative_target_count, merged.size()));
             }
 
-            // Binary mode keeps line endings LF-only on every platform.
-            // utils/merge.cpp writes '\n' literally; without binary mode
-            // MSVC would translate to "\r\n" and break byte-equivalence
-            // with analyze.py's output.
-            std::ofstream out(outCsv,
-                              std::ios::out | std::ios::trunc | std::ios::binary);
-            if (!out) {
-                ErrorLog(fmt::format("Failed to open merged output {}\n",
-                                     outCsv.string()));
-                removeStale();
-                return;
-            }
-            merge::WriteMergedCsv(out, merged, stats);
-            out.flush();
-            // After write + flush, the ofstream sets failbit if any inserter
-            // hit a hard error (ENOSPC, sandboxed write denial, broken pipe,
-            // etc.). Surfacing the failure here turns a silently-truncated
-            // merged CSV into an obvious "Wrote ... failed" line in the log.
-            if (!out.good()) {
+            // Write to a sibling temp file, then atomically rename it over
+            // outCsv -- so the previous merged CSV is replaced only once a
+            // complete, valid new one exists, and survives any failure here.
+            // Binary mode keeps line endings LF-only on every platform:
+            // utils/merge.cpp writes '\n' literally; without binary mode MSVC
+            // would translate to "\r\n" and break byte-equivalence with
+            // analyze.py's output.
+            fs::path tmpCsv = outCsv;
+            tmpCsv += ".tmp";
+            {
+                std::ofstream out(
+                    tmpCsv, std::ios::out | std::ios::trunc | std::ios::binary);
+                if (!out) {
+                    ErrorLog(fmt::format(
+                        "Failed to open merged temp output {} (previous "
+                        "merged CSV left intact)\n",
+                        tmpCsv.string()));
+                    return;
+                }
+                merge::WriteMergedCsv(out, merged, stats);
+                out.flush();
+                // The ofstream sets failbit if any inserter hit a hard error
+                // (ENOSPC, sandboxed write denial, broken pipe). Detect it
+                // before the rename so a half-written temp can never replace a
+                // good destination.
+                if (!out.good()) {
+                    ErrorLog(fmt::format(
+                        "Merged output write failed (disk full / lost write "
+                        "access during the merge): {} (previous merged CSV "
+                        "left intact)\n",
+                        tmpCsv.string()));
+                    out.close();
+                    std::error_code rmEc;
+                    fs::remove(tmpCsv, rmEc);  // drop the partial temp
+                    return;
+                }
+            }  // close the stream before rename (Windows won't move an open file)
+
+            // Atomic replace on the same directory/volume. On failure the
+            // previous merged CSV is untouched and the new data remains in the
+            // temp file, so nothing is lost either way.
+            std::error_code ec;
+            fs::rename(tmpCsv, outCsv, ec);
+            if (ec) {
                 ErrorLog(fmt::format(
-                    "Merged output write failed (disk full / lost write "
-                    "access during the merge): {}\n",
-                    outCsv.string()));
-                removeStale();
+                    "Failed to replace merged output {} (the new merge is at "
+                    "{}): {}\n",
+                    outCsv.string(), tmpCsv.string(), ec.message()));
                 return;
             }
             Log(fmt::format("Wrote merged CSV: {} ({} frames)\n",
