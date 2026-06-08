@@ -52,6 +52,7 @@
 #include <deque>
 #include <iomanip>
 #include <iostream>
+#include <locale>
 #include <mutex>
 #include <filesystem>
 #include <fstream>

@@ -28,6 +28,7 @@
 #include <charconv>
 #include <cmath>
 #include <fstream>
+#include <locale>
 #include <map>
 #include <sstream>
 #include <string>
@@ -116,6 +117,9 @@ namespace openxr_api_layer::merge {
             RawFrameRow r{};
             char c;
             std::stringstream ss(line);
+            // Classic locale so a grouping global locale can't misparse the
+            // integer fields (mirrors the writer side).
+            ss.imbue(std::locale::classic());
             if (ss >> r.display_time >> c >> r.thread_id >> c >> r.qpc_entry >> c >>
                 r.qpc_exit) {
                 result.rows.push_back(r);
@@ -154,6 +158,9 @@ namespace openxr_api_layer::merge {
             RawGpuRow r{};
             char c;
             std::stringstream ss(line);
+            // Classic locale so a grouping global locale can't misparse the
+            // integer fields (mirrors the writer side).
+            ss.imbue(std::locale::classic());
             if (ss >> r.display_time >> c >> r.gpu_ticks >> c >> r.gpu_freq >> c >>
                 r.valid) {
                 result.rows.push_back(r);
@@ -361,6 +368,11 @@ namespace openxr_api_layer::merge {
     void WriteMergedCsv(std::ostream& out,
                         const std::vector<MergedRow>& merged,
                         const MergeStats& stats) {
+        // Pin the classic locale so a host that installed a thousands-grouping
+        // global locale cannot inject separators into the integer columns
+        // (frame_count, display_time, thread_id) and corrupt the CSV. Floats
+        // already go through fmt (locale-independent).
+        out.imbue(std::locale::classic());
         out << "# frame_count=" << stats.frame_count << '\n'
             << "# target_ms_mean=" << fmt::format("{:.4f}", stats.target_ms_mean) << '\n'
             << "# target_ms_min="  << fmt::format("{:.4f}", stats.target_ms_min)  << '\n'

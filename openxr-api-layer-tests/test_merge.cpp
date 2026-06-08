@@ -47,6 +47,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <locale>
 #include <random>
 #include <sstream>
 #include <string>
@@ -967,4 +968,52 @@ TEST_CASE("end-to-end: with GPU CSVs the join fills target_gpu_us") {
     // Each data row carries the .3f-rounded GPU delta as its last cell.
     CHECK(s.find(",5.000\n") != std::string::npos);
     CHECK(s.find(",8.000\n") != std::string::npos);
+}
+
+// ============================================================================
+// Locale immunity (#6): integer columns must not pick up a grouping locale
+// ============================================================================
+
+TEST_CASE("WriteMergedCsv integer columns survive a grouping global locale") {
+    // Some middleware / Qt launchers call std::locale::global(std::locale(""))
+    // and land on a thousands-grouping locale. Our integer columns must NOT
+    // then sprout separators like "1,234,567" -- that injects spurious CSV
+    // fields and corrupts the merge. WriteMergedCsv pins std::locale::classic()
+    // on its stream to stay immune. (Floats go through fmt, already locale-
+    // independent, so only the integer columns are at risk.)
+    struct Grouping : std::numpunct<char> {
+        char do_thousands_sep() const override { return ','; }
+        std::string do_grouping() const override { return "\3"; }
+    };
+    // RAII restore so a CHECK/REQUIRE failure can't leak the grouping locale
+    // into every later TEST_CASE in this binary.
+    struct LocaleGuard {
+        std::locale prev;
+        explicit LocaleGuard(const std::locale& loc)
+            : prev(std::locale::global(loc)) {}
+        ~LocaleGuard() { std::locale::global(prev); }
+    } guard(std::locale(std::locale::classic(), new Grouping));
+
+    // Confirm the guard actually installed a grouping locale (else the test
+    // would pass vacuously).
+    {
+        std::ostringstream probe;
+        probe << 1234567;
+        REQUIRE(probe.str() == "1,234,567");
+    }
+
+    // Large display_time + thread_id so grouping would be visible if it leaked.
+    const auto merged = ComputeMerge(
+        {Row(1234567, 89012, 10'000'000, 10'001'100)}, 10'000'000,
+        {Row(1234567, 89012, 10'000'400, 10'001'000)}, 10'000'000);
+    REQUIRE(merged.size() == 1);
+
+    std::ostringstream out;  // inherits the grouping locale at construction
+    WriteMergedCsv(out, merged, ComputeStats(merged));
+    const std::string s = out.str();
+
+    // The data row must carry raw integers -- exact prefix, no separators.
+    CHECK(s.find("1234567,89012,") != std::string::npos);
+    CHECK(s.find("1,234,567") == std::string::npos);
+    CHECK(s.find("89,012") == std::string::npos);
 }

@@ -576,6 +576,12 @@ namespace openxr_api_layer {
                         open_failed = true;
                         return false;
                     }
+                    // Pin the classic locale so a host that installed a
+                    // thousands-grouping global locale cannot inject separators
+                    // into the integer CSV columns (qpc_freq header,
+                    // display_time, thread_id, qpc/gpu values) and corrupt the
+                    // file. Floats are written via fmt (locale-independent).
+                    stream.imbue(std::locale::classic());
                     Traits::WriteHeader(stream);
                     return true;
                 };
