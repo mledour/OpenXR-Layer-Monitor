@@ -278,11 +278,14 @@ namespace openxr_api_layer {
         //   - AltGr's synthetic LCtrl is masked in SampleHotkeyDown so
         //     AZERTY users can press AltGr+F9 (the debugger run key)
         //     without toggling the recording.
-        //   - The caller debounces successful toggles to >= 500 ms so a
-        //     remapper / OBS / ShadowPlay that fires Ctrl+F9 twice in
-        //     quick succession cannot churn the recording (the merge
-        //     stall is 10-50 ms; a stutter on every double-tap is
-        //     unacceptable).
+        //   - The caller debounces successful STARTs to >= 500 ms so a
+        //     remapper / OBS / ShadowPlay firing Ctrl+F9 repeatedly cannot
+        //     flap the recording on. A STOP is NEVER debounced: dropping it
+        //     would leave the writers running after the user pressed Ctrl+F9
+        //     to stop. A rapid START->STOP pair therefore nets to OFF as
+        //     intended; its merge covers only the handful of frames in that
+        //     <500 ms window (cheap -- not the 10-50 ms stall of a full
+        //     session).
         //
         // The atomic exchange is explicitly memory_order_acq_rel so the
         // ordering convention used elsewhere in this file (release stores,
@@ -1425,24 +1428,32 @@ namespace openxr_api_layer {
             if constexpr (kIsPreSide) {
                 // -------- PRE side --------
                 if (ConsumeHotkeyEdge()) {
-                    // Debounce: ignore an edge that lands within
-                    // kDebounceMs of the previous toggle. Catches OBS /
-                    // ShadowPlay instant-replay bindings that fire
-                    // Ctrl+F9 twice in quick succession (a churned
-                    // START/STOP would stall the frame thread on the
-                    // merge -- documented in the README's Limitations).
-                    constexpr int64_t kDebounceMs = 500;
+                    // The 500 ms debounce applies ONLY to turning monitoring
+                    // ON. It swallows remapper / OBS / ShadowPlay bindings that
+                    // fire Ctrl+F9 repeatedly so the recording cannot flap on.
+                    // A STOP is ALWAYS honored: because each edge toggles, the
+                    // swallowed second edge of a rapid pair is always the STOP,
+                    // so the old direction-agnostic debounce dropped exactly
+                    // the press the user cared about -- leaving the writers
+                    // running and the CSVs growing after they pressed Ctrl+F9
+                    // to stop. Now a deliberate fast START->STOP ends OFF, and a
+                    // spurious double-fire nets to OFF (its few-frame merge is
+                    // cheap) instead of leaving monitoring stuck ON.
+                    const bool target =
+                        !g_monitoring.load(std::memory_order_acquire);
                     const int64_t now = Qpc();
-                    const int64_t freq = QpcFreqHz();
-                    const int64_t debounceTicks =
-                        (freq * kDebounceMs) / 1000;
-                    const int64_t last =
-                        g_lastToggleQpc.load(std::memory_order_acquire);
-                    if (last == 0 || (now - last) >= debounceTicks) {
-                        g_lastToggleQpc.store(
-                            now, std::memory_order_release);
-                        ApplyToggle(
-                            !g_monitoring.load(std::memory_order_acquire));
+                    bool apply = true;
+                    if (target) {  // START -- debounce rapid / spurious edges
+                        constexpr int64_t kDebounceMs = 500;
+                        const int64_t debounceTicks =
+                            (QpcFreqHz() * kDebounceMs) / 1000;
+                        const int64_t last =
+                            g_lastToggleQpc.load(std::memory_order_acquire);
+                        apply = (last == 0 || (now - last) >= debounceTicks);
+                    }
+                    if (apply) {
+                        g_lastToggleQpc.store(now, std::memory_order_release);
+                        ApplyToggle(target);
                     }
                 }
 
