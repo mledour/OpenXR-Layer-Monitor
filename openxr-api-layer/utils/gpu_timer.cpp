@@ -476,19 +476,33 @@ namespace openxr_api_layer::gpu {
                 ID3D12CommandList* lists[] = { slot.cmdList.Get() };
                 m_queue->ExecuteCommandLists(1, lists);
                 const UINT64 nextFenceValue = ++m_fenceCounter;
-                // Signal CAN fail (DEVICE_REMOVED on TDR, transient
-                // E_OUTOFMEMORY). If it does, the fence will never reach
-                // nextFenceValue and this slot becomes permanently un-
-                // drainable (the pre-check would block every wrap-around
-                // for the rest of the session). Use the sentinel fence
-                // value 0 so the slot is treated as "never submitted"
-                // and PollResolved skips it instead.
-                if (FAILED(m_queue->Signal(m_fence.Get(), nextFenceValue))) {
-                    m_droppedFrames.fetch_add(
-                        1, std::memory_order_relaxed);
-                    slot.fenceValue = 0;
-                    return;
-                }
+                // ExecuteCommandLists ABOVE already submitted this slot's work,
+                // so it is in flight on the GPU whether or not the Signal below
+                // lands. Tag the slot with nextFenceValue UNCONDITIONALLY and
+                // gate reuse on the fence. The previous code stored the
+                // "never submitted" sentinel (0) when Signal failed -- which
+                // let the next ring wrap's pre-check skip this slot and Reset()
+                // its allocator while the GPU was still executing it: a
+                // use-after-free the D3D12 debug layer flags and release builds
+                // can TDR.
+                //
+                // Keeping nextFenceValue is safe because the queue is in-order:
+                //   * transient failure (E_OUTOFMEMORY): a later frame's Signal
+                //     advances the fence past nextFenceValue, so
+                //     GetCompletedValue() >= nextFenceValue then proves this
+                //     work is done -- the pre-check allows reuse and
+                //     PollResolved can still resolve the already-written
+                //     timestamp;
+                //   * device removed (TDR): GetCompletedValue() returns
+                //     UINT64_MAX, so reuse is allowed and the allocator Reset
+                //     just fails harmlessly on the dead device;
+                //   * no later Signal ever lands: the slot stays Pending and is
+                //     counted as a drop when the ring overwrites it -- never a
+                //     Reset() of in-flight work.
+                // The HRESULT is deliberately discarded: RecordTimestamp runs on
+                // the per-frame render path where Log() is forbidden, and the
+                // fence gating handles every outcome above.
+                (void)m_queue->Signal(m_fence.Get(), nextFenceValue);
                 slot.fenceValue = nextFenceValue;
             }
 
