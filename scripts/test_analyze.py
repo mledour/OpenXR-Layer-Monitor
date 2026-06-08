@@ -562,3 +562,59 @@ def test_gpu_lf_only_line_endings(tmp_path: Path) -> None:
     assert rc == 0
     raw = (tmp_path / f"frames-merged-{pid}.csv").read_bytes()
     assert b"\r" not in raw, "merged CSV with GPU column must remain LF-only"
+
+
+# ----------------------------------------------------------------------------
+# Tolerant parsing (#8): malformed input degrades, it does not crash
+# ----------------------------------------------------------------------------
+
+def _write_lines(path: Path, lines: list[str]) -> None:
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write("".join(lines))
+
+
+def test_malformed_qpc_freq_header_falls_back_instead_of_crashing(
+        tmp_path: Path) -> None:
+    """A non-integer qpc_freq value ("1e7") must NOT crash the analyzer with a
+    ValueError; it falls back to the 10 MHz default, matching merge.cpp's
+    StrictStoll. Both sides fall back to the same default, so the merge still
+    produces output."""
+    header = ("# qpc_freq=1e7\n# side={side}\n# layer=test\n# fn=xrEndFrame\n"
+              "display_time,thread_id,qpc_entry,qpc_exit\n")
+    pre = tmp_path / "frames-810-pre.csv"
+    post = tmp_path / "frames-810-post.csv"
+    _write_lines(pre, [header.format(side="pre"), "100,1,1000000,1001000\n"])
+    _write_lines(post, [header.format(side="post"), "100,1,1000400,1001000\n"])
+
+    rc, _, stderr = run_analyze(pre, post)
+    assert rc == 0, f"analyzer crashed on malformed qpc_freq: {stderr}"
+    assert (tmp_path / "frames-merged-810.csv").exists()
+    assert "qpc_freq" in stderr.lower()  # warned about the fallback
+
+
+def test_truncated_data_row_is_skipped_instead_of_crashing(
+        tmp_path: Path) -> None:
+    """A half-flushed / short data row must be skipped (not crash), matching
+    the C++ merge which drops rows whose four fields don't all parse."""
+    header = ("# qpc_freq=10000000\n# side={side}\n# layer=test\n"
+              "# fn=xrEndFrame\ndisplay_time,thread_id,qpc_entry,qpc_exit\n")
+    pre = tmp_path / "frames-811-pre.csv"
+    post = tmp_path / "frames-811-post.csv"
+    _write_lines(pre, [
+        header.format(side="pre"),
+        "100,1,1000000,1001000\n",
+        "101,1,1010000\n",            # truncated (3 fields) -> skipped
+        "102,1,1020000,1021000\n",
+    ])
+    _write_lines(post, [
+        header.format(side="post"),
+        "100,1,1000400,1001000\n",
+        "102,1,1020400,1021000\n",
+    ])
+
+    rc, _, stderr = run_analyze(pre, post)
+    assert rc == 0, f"analyzer crashed on a truncated row: {stderr}"
+    text = (tmp_path / "frames-merged-811.csv").read_text(encoding="utf-8")
+    # Only the two well-formed frames (100, 102) survive; 101 was dropped.
+    assert "# frame_count=2\n" in text
+    assert "skipped" in stderr.lower()

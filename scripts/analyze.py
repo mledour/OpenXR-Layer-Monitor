@@ -48,6 +48,11 @@ from pathlib import Path
 RAW_COLUMNS = ("display_time", "thread_id", "qpc_entry", "qpc_exit")
 GPU_COLUMNS = ("display_time", "gpu_ticks", "gpu_freq", "valid")
 
+# Mirrors merge.cpp's kDefaultQpcFreq: used when a per-side CSV has no
+# (or a malformed) "# qpc_freq=" header, so a garbage value degrades to a
+# known default instead of crashing the analyzer.
+DEFAULT_QPC_FREQ = 10_000_000
+
 
 @dataclass
 class Frames:
@@ -62,9 +67,25 @@ class GpuFrames:
     rows: list[tuple[int, int, int, int]]  # display_time, gpu_ticks, gpu_freq, valid
 
 
+def _parse_int4(raw: list[str]) -> tuple[int, int, int, int] | None:
+    """Parse a four-integer CSV row, or None if it doesn't cleanly parse.
+
+    Mirrors the C++ merge (ReadFrameCsv / ReadGpuCsv), which SKIPS a row whose
+    four fields don't all extract -- a truncated or half-flushed row from a
+    crash -- rather than aborting. Python's int() is strict, so without this a
+    single bad row would raise ValueError (or IndexError on too few columns)
+    and crash the whole analyzer where the in-DLL merge just drops the row.
+    """
+    try:
+        return (int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]))
+    except (ValueError, IndexError):
+        return None
+
+
 def load(path: Path) -> Frames:
     meta: dict[str, str] = {}
     rows: list[tuple[int, int, int, int]] = []
+    skipped = 0
     with path.open("r", encoding="utf-8") as fh:
         reader = csv.reader(fh)
         header_found = False
@@ -90,10 +111,27 @@ def load(path: Path) -> Frames:
                     )
                 header_found = True
                 continue
-            rows.append((int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3])))
+            parsed = _parse_int4(raw)
+            if parsed is None:
+                skipped += 1
+                continue
+            rows.append(parsed)
+    if skipped:
+        print(f"warning: {path}: skipped {skipped} malformed/truncated row(s)",
+              file=sys.stderr)
+    # Tolerate a malformed "# qpc_freq=" value (e.g. "1e7", "10 MHz") the way
+    # merge.cpp's StrictStoll does -- fall back to the default rather than
+    # crashing on int().
+    freq_raw = meta.get("qpc_freq", str(DEFAULT_QPC_FREQ))
+    try:
+        qpc_freq = int(freq_raw)
+    except ValueError:
+        print(f"warning: {path}: ignoring malformed qpc_freq={freq_raw!r}, "
+              f"using {DEFAULT_QPC_FREQ}", file=sys.stderr)
+        qpc_freq = DEFAULT_QPC_FREQ
     return Frames(
         side=meta.get("side", path.stem),
-        qpc_freq=int(meta.get("qpc_freq", "10000000")),
+        qpc_freq=qpc_freq,
         rows=rows,
     )
 
@@ -111,6 +149,7 @@ def load_gpu(path: Path) -> GpuFrames | None:
         return None
     meta: dict[str, str] = {}
     rows: list[tuple[int, int, int, int]] = []
+    skipped = 0
     with path.open("r", encoding="utf-8") as fh:
         reader = csv.reader(fh)
         header_found = False
@@ -133,7 +172,14 @@ def load_gpu(path: Path) -> GpuFrames | None:
                     return None
                 header_found = True
                 continue
-            rows.append((int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3])))
+            parsed = _parse_int4(raw)
+            if parsed is None:
+                skipped += 1
+                continue
+            rows.append(parsed)
+    if skipped:
+        print(f"warning: {path}: skipped {skipped} malformed/truncated "
+              f"GPU row(s)", file=sys.stderr)
     return GpuFrames(side=meta.get("side", path.stem), rows=rows)
 
 
