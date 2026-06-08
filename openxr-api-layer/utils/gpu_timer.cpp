@@ -105,7 +105,7 @@ namespace openxr_api_layer::gpu {
                 return true;
             }
 
-            void RecordTimestamp(uint64_t frame_idx) override {
+            void RecordTimestamp(uint64_t display_time) override {
                 if (!m_active) {
                     return;
                 }
@@ -113,7 +113,7 @@ namespace openxr_api_layer::gpu {
                 // frames behind, a >~44 ms stall at 90 Hz) the oldest
                 // unresolved entry is silently overwritten -- we bump the
                 // drop counter so the GPU CSV footer can surface it.
-                const auto reserved = m_ring.Reserve(frame_idx);
+                const auto reserved = m_ring.Reserve(display_time);
                 if (reserved.overwrote_pending) {
                     m_droppedFrames.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -133,8 +133,8 @@ namespace openxr_api_layer::gpu {
                 // poll, preserving frame order in the CSV.
                 while (true) {
                     std::size_t slot_index = 0;
-                    uint64_t frame_idx = 0;
-                    if (!m_ring.PeekOldest(slot_index, frame_idx)) {
+                    uint64_t display_time = 0;
+                    if (!m_ring.PeekOldest(slot_index, display_time)) {
                         break;
                     }
                     auto& pair = m_querySlots[slot_index];
@@ -166,7 +166,7 @@ namespace openxr_api_layer::gpu {
                         (!disjointData.Disjoint && disjointData.Frequency != 0)
                             ? 1u
                             : 0u;
-                    out.push_back(GpuRow{frame_idx, ticks,
+                    out.push_back(GpuRow{display_time, ticks,
                                          disjointData.Frequency, valid});
                     m_ring.ConsumeOldest();
                 }
@@ -408,7 +408,7 @@ namespace openxr_api_layer::gpu {
                 return true;
             }
 
-            void RecordTimestamp(uint64_t frame_idx) override {
+            void RecordTimestamp(uint64_t display_time) override {
                 if (!m_active) {
                     return;
                 }
@@ -428,7 +428,7 @@ namespace openxr_api_layer::gpu {
                 }
 
                 // Now safe to advance the ring + reset the allocator.
-                const auto reserved = m_ring.Reserve(frame_idx);
+                const auto reserved = m_ring.Reserve(display_time);
                 // Reserve() may report overwrote_pending=true when the
                 // PRE-CHECK above passed (GPU is caught up on this slot)
                 // but the consumer hadn't yet drained the slot in
@@ -500,8 +500,8 @@ namespace openxr_api_layer::gpu {
                 // stream order so the FIFO drain is preserved.
                 while (true) {
                     std::size_t slot_index = 0;
-                    uint64_t frame_idx = 0;
-                    if (!m_ring.PeekOldest(slot_index, frame_idx)) {
+                    uint64_t display_time = 0;
+                    if (!m_ring.PeekOldest(slot_index, display_time)) {
                         break;
                     }
                     auto& slot = m_slots[slot_index];
@@ -537,7 +537,7 @@ namespace openxr_api_layer::gpu {
                     // own guards (post_ticks >= pre_ticks, freq match)
                     // still catch driver bugs / clock anomalies.
                     const uint32_t valid = mapOk ? 1u : 0u;
-                    out.push_back(GpuRow{frame_idx, ticks,
+                    out.push_back(GpuRow{display_time, ticks,
                                          m_frequency, valid});
                     m_ring.ConsumeOldest();
                 }

@@ -116,7 +116,7 @@ namespace openxr_api_layer::merge {
             RawFrameRow r{};
             char c;
             std::stringstream ss(line);
-            if (ss >> r.frame_idx >> c >> r.thread_id >> c >> r.qpc_entry >> c >>
+            if (ss >> r.display_time >> c >> r.thread_id >> c >> r.qpc_entry >> c >>
                 r.qpc_exit) {
                 result.rows.push_back(r);
             }
@@ -154,7 +154,7 @@ namespace openxr_api_layer::merge {
             RawGpuRow r{};
             char c;
             std::stringstream ss(line);
-            if (ss >> r.frame_idx >> c >> r.gpu_ticks >> c >> r.gpu_freq >> c >>
+            if (ss >> r.display_time >> c >> r.gpu_ticks >> c >> r.gpu_freq >> c >>
                 r.valid) {
                 result.rows.push_back(r);
             }
@@ -172,18 +172,18 @@ namespace openxr_api_layer::merge {
         using Key = std::pair<uint64_t, uint32_t>;
         const auto mk = [](uint64_t fi, uint32_t tid) -> Key { return {fi, tid}; };
 
-        // Index post by (frame_idx, thread_id). We will erase entries as
+        // Index post by (display_time, thread_id). We will erase entries as
         // they are matched so a duplicate pre key cannot re-match the same
         // post entry twice -- matches analyze.py's post_index.pop().
         std::map<Key, RawFrameRow> postIndex;
         for (const auto& r : postRows) {
-            postIndex[mk(r.frame_idx, r.thread_id)] = r;
+            postIndex[mk(r.display_time, r.thread_id)] = r;
         }
 
         // Compute next pre.qpc_entry per thread for frame_interval_us.
         std::map<uint32_t, std::vector<std::pair<uint64_t, int64_t>>> preByThread;
         for (const auto& r : preRows) {
-            preByThread[r.thread_id].emplace_back(r.frame_idx, r.qpc_entry);
+            preByThread[r.thread_id].emplace_back(r.display_time, r.qpc_entry);
         }
         for (auto& [tid, items] : preByThread) {
             std::sort(items.begin(), items.end());
@@ -199,7 +199,7 @@ namespace openxr_api_layer::merge {
         std::vector<MergedRow> merged;
         merged.reserve(preRows.size());
         for (const auto& pre : preRows) {
-            const auto it = postIndex.find(mk(pre.frame_idx, pre.thread_id));
+            const auto it = postIndex.find(mk(pre.display_time, pre.thread_id));
             if (it == postIndex.end()) {
                 continue;
             }
@@ -207,14 +207,14 @@ namespace openxr_api_layer::merge {
             postIndex.erase(it);  // consume on match -- prevents double-counting
 
             MergedRow m{};
-            m.frame_idx = pre.frame_idx;
+            m.display_time = pre.display_time;
             m.thread_id = pre.thread_id;
             m.pre_us =
                 static_cast<double>(pre.qpc_exit - pre.qpc_entry) / freq * 1e6;
             m.post_us =
                 static_cast<double>(post.qpc_exit - post.qpc_entry) / freq * 1e6;
             m.target_us = m.pre_us - m.post_us;
-            if (const auto ne = nextEntry.find(mk(pre.frame_idx, pre.thread_id));
+            if (const auto ne = nextEntry.find(mk(pre.display_time, pre.thread_id));
                 ne != nextEntry.end()) {
                 const double fiv =
                     static_cast<double>(ne->second - pre.qpc_entry) / freq * 1e6;
@@ -230,7 +230,7 @@ namespace openxr_api_layer::merge {
             }
             merged.push_back(m);
         }
-        // stable_sort: defends against duplicate (thread, frame_idx) keys
+        // stable_sort: defends against duplicate (thread, display_time) keys
         // sneaking through if a future refactor weakens the consume-on-match
         // contract above.
         std::stable_sort(merged.begin(), merged.end(),
@@ -238,7 +238,7 @@ namespace openxr_api_layer::merge {
                              if (a.thread_id != b.thread_id) {
                                  return a.thread_id < b.thread_id;
                              }
-                             return a.frame_idx < b.frame_idx;
+                             return a.display_time < b.display_time;
                          });
         return merged;
     }
@@ -246,21 +246,21 @@ namespace openxr_api_layer::merge {
     void JoinGpu(std::vector<MergedRow>& merged,
                  const std::vector<RawGpuRow>& preGpu,
                  const std::vector<RawGpuRow>& postGpu) {
-        // Index both sides by frame_idx (GPU rows carry no thread_id; D3D11
-        // submission is single-threaded so frame_idx is a complete key).
+        // Index both sides by display_time (GPU rows carry no thread_id; D3D11
+        // submission is single-threaded so display_time is a complete key).
         // operator[] = last-wins on duplicate keys, matching analyze.py's
-        // {r.frame_idx: r for r in rows} dict comprehension.
+        // {r.display_time: r for r in rows} dict comprehension.
         std::map<uint64_t, RawGpuRow> preIdx;
         std::map<uint64_t, RawGpuRow> postIdx;
         for (const auto& r : preGpu) {
-            preIdx[r.frame_idx] = r;
+            preIdx[r.display_time] = r;
         }
         for (const auto& r : postGpu) {
-            postIdx[r.frame_idx] = r;
+            postIdx[r.display_time] = r;
         }
         for (auto& m : merged) {
-            const auto p = preIdx.find(m.frame_idx);
-            const auto q = postIdx.find(m.frame_idx);
+            const auto p = preIdx.find(m.display_time);
+            const auto q = postIdx.find(m.display_time);
             if (p == preIdx.end() || q == postIdx.end()) {
                 continue;  // no GPU sample on one or both sides
             }
@@ -372,10 +372,10 @@ namespace openxr_api_layer::merge {
             << "# target_gpu_ms_mean=" << fmt::format("{:.4f}", stats.target_gpu_ms_mean) << '\n'
             << "# target_gpu_ms_min="  << fmt::format("{:.4f}", stats.target_gpu_ms_min)  << '\n'
             << "# target_gpu_ms_max="  << fmt::format("{:.4f}", stats.target_gpu_ms_max)  << '\n'
-            << "frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,"
+            << "display_time,thread_id,frame_interval_us,pre_us,post_us,target_us,"
                "target_pct_of_frame,target_gpu_us\n";
         for (const auto& m : merged) {
-            out << m.frame_idx << ',' << m.thread_id << ',';
+            out << m.display_time << ',' << m.thread_id << ',';
             if (m.frame_interval_us.has_value()) {
                 out << fmt::format("{:.3f}", *m.frame_interval_us);
             }

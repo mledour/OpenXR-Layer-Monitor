@@ -54,7 +54,7 @@ using openxr_api_layer::gpu::detail::SlotState;
 
 namespace {
 
-    // Drain every Pending slot via Peek + Consume and collect the frame_idx
+    // Drain every Pending slot via Peek + Consume and collect the frame index
     // values in resolution order. Mirrors what GpuTimerD3D11::PollResolved
     // does once GetData reports ready -- minus the D3D calls.
     template <std::size_t N>

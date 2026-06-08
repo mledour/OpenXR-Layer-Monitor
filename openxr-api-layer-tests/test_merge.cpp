@@ -35,7 +35,7 @@
 //   * Multi-thread frame_interval computation (per thread, not global).
 //   * Last frame per thread = no successor = no frame_interval / no pct.
 //   * Negative target_us (QPC noise floor) flagged in MergeStats.
-//   * Deterministic sort order in ComputeMerge: (thread_id, frame_idx).
+//   * Deterministic sort order in ComputeMerge: (thread_id, display_time).
 //   * Exact byte format produced by WriteMergedCsv -- this is the contract
 //     between the in-DLL merge and analyze.py.
 // =============================================================================
@@ -91,7 +91,7 @@ namespace {
     //   # side=...
     //   # layer=...
     //   # fn=xrEndFrame
-    //   frame_idx,thread_id,qpc_entry,qpc_exit
+    //   display_time,thread_id,qpc_entry,qpc_exit
     //   <rows>
     // Header lines are optional (callers pass nullopt to omit qpc_freq).
     fs::path WriteRawCsv(const std::string& name,
@@ -104,9 +104,9 @@ namespace {
             out << "# qpc_freq=" << *qpcFreq << '\n';
         }
         out << "# side=test\n# layer=test\n# fn=xrEndFrame\n"
-            << "frame_idx,thread_id,qpc_entry,qpc_exit\n";
+            << "display_time,thread_id,qpc_entry,qpc_exit\n";
         for (const auto& r : rows) {
-            out << r.frame_idx << ',' << r.thread_id << ','
+            out << r.display_time << ',' << r.thread_id << ','
                 << r.qpc_entry << ',' << r.qpc_exit << '\n';
         }
         return path;
@@ -128,7 +128,7 @@ namespace {
     //   # side=...
     //   # layer=...
     //   # fn=xrEndFrame
-    //   frame_idx,gpu_ticks,gpu_freq,valid
+    //   display_time,gpu_ticks,gpu_freq,valid
     //   <rows>
     fs::path WriteGpuCsv(const std::string& name,
                          const std::vector<RawGpuRow>& rows) {
@@ -136,9 +136,9 @@ namespace {
         std::ofstream out(path, std::ios::out | std::ios::trunc);
         REQUIRE(out);
         out << "# gpu_clock=d3d11\n# side=test\n# layer=test\n# fn=xrEndFrame\n"
-            << "frame_idx,gpu_ticks,gpu_freq,valid\n";
+            << "display_time,gpu_ticks,gpu_freq,valid\n";
         for (const auto& r : rows) {
-            out << r.frame_idx << ',' << r.gpu_ticks << ','
+            out << r.display_time << ',' << r.gpu_ticks << ','
                 << r.gpu_freq << ',' << r.valid << '\n';
         }
         return path;
@@ -169,7 +169,7 @@ TEST_CASE("ReadFrameCsv: parses qpc_freq header") {
     const auto parsed = ReadFrameCsv(path, /*defaultFreq=*/99);
     CHECK(parsed.qpc_freq == 1234567);
     REQUIRE(parsed.rows.size() == 1);
-    CHECK(parsed.rows[0].frame_idx == 0);
+    CHECK(parsed.rows[0].display_time == 0);
     CHECK(parsed.rows[0].thread_id == 100);
     CHECK(parsed.rows[0].qpc_entry == 1'000);
     CHECK(parsed.rows[0].qpc_exit == 1'500);
@@ -195,7 +195,7 @@ TEST_CASE("ReadFrameCsv: malformed qpc_freq value keeps defaultFreq") {
         {
             std::ofstream out(path);
             out << "# qpc_freq=" << freqLiteral << "\n"
-                << "frame_idx,thread_id,qpc_entry,qpc_exit\n"
+                << "display_time,thread_id,qpc_entry,qpc_exit\n"
                 << "0,1,10,20\n";
         }
         const auto parsed = ReadFrameCsv(path, /*defaultFreq=*/42);
@@ -217,7 +217,7 @@ TEST_CASE("ReadFrameCsv: empty lines and stray comments are ignored") {
             << "# qpc_freq=1000\n"
             << "\n"
             << "# random comment\n"
-            << "frame_idx,thread_id,qpc_entry,qpc_exit\n"
+            << "display_time,thread_id,qpc_entry,qpc_exit\n"
             << "0,1,10,20\n"
             << "\n"
             << "1,1,30,40\n";
@@ -225,8 +225,8 @@ TEST_CASE("ReadFrameCsv: empty lines and stray comments are ignored") {
     const auto parsed = ReadFrameCsv(path, /*defaultFreq=*/0);
     CHECK(parsed.qpc_freq == 1000);
     REQUIRE(parsed.rows.size() == 2);
-    CHECK(parsed.rows[0].frame_idx == 0);
-    CHECK(parsed.rows[1].frame_idx == 1);
+    CHECK(parsed.rows[0].display_time == 0);
+    CHECK(parsed.rows[1].display_time == 1);
 }
 
 TEST_CASE("ReadFrameCsv: header_valid is false when the column header does not "
@@ -239,7 +239,7 @@ TEST_CASE("ReadFrameCsv: header_valid is false when the column header does not "
         std::ofstream out(path);
         out << "# frame_count=42\n"
             << "# target_ms_mean=0.0123\n"
-            << "frame_idx,thread_id,frame_interval_us,pre_us,post_us,"
+            << "display_time,thread_id,frame_interval_us,pre_us,post_us,"
                "target_us,target_pct_of_frame,target_gpu_us\n"
             << "0,1,11100.000,1.234,0.123,1.111,0.0100,5.000\n";
     }
@@ -255,7 +255,7 @@ TEST_CASE("ReadFrameCsv: trailing CR on the column header still validates") {
     {
         std::ofstream out(path, std::ios::out | std::ios::binary);
         out << "# qpc_freq=10000000\r\n"
-            << "frame_idx,thread_id,qpc_entry,qpc_exit\r\n"
+            << "display_time,thread_id,qpc_entry,qpc_exit\r\n"
             << "0,1,10,20\r\n";
     }
     const auto parsed = ReadFrameCsv(path, 0);
@@ -269,15 +269,15 @@ TEST_CASE("ReadFrameCsv: a row with too few fields is skipped not crashed") {
     {
         std::ofstream out(path);
         out << "# qpc_freq=1000\n"
-            << "frame_idx,thread_id,qpc_entry,qpc_exit\n"
+            << "display_time,thread_id,qpc_entry,qpc_exit\n"
             << "0,1,10,20\n"
             << "garbage_with,too_few_fields\n"
             << "2,1,50,60\n";
     }
     const auto parsed = ReadFrameCsv(path, 0);
     REQUIRE(parsed.rows.size() == 2);
-    CHECK(parsed.rows[0].frame_idx == 0);
-    CHECK(parsed.rows[1].frame_idx == 2);
+    CHECK(parsed.rows[0].display_time == 0);
+    CHECK(parsed.rows[1].display_time == 2);
 }
 
 // ============================================================================
@@ -296,7 +296,7 @@ TEST_CASE("ComputeMerge: single matched pair, no successor leaves interval blank
     const std::vector<RawFrameRow> post = {Row(0, 1, 1'100, 1'900)};
     const auto m = ComputeMerge(pre, 1'000'000, post, 1'000'000);
     REQUIRE(m.size() == 1);
-    CHECK(m[0].frame_idx == 0);
+    CHECK(m[0].display_time == 0);
     CHECK(m[0].thread_id == 1);
     CHECK(m[0].pre_us == doctest::Approx(1000.0));
     CHECK(m[0].post_us == doctest::Approx(800.0));
@@ -320,7 +320,7 @@ TEST_CASE("ComputeMerge: two frames same thread, first row has interval second h
     REQUIRE(m.size() == 2);
 
     // Frame 0: has successor (frame 1).
-    CHECK(m[0].frame_idx == 0);
+    CHECK(m[0].display_time == 0);
     CHECK(m[0].pre_us == doctest::Approx(100.0));
     CHECK(m[0].post_us == doctest::Approx(50.0));
     CHECK(m[0].target_us == doctest::Approx(50.0));
@@ -331,7 +331,7 @@ TEST_CASE("ComputeMerge: two frames same thread, first row has interval second h
           doctest::Approx(50.0 / 111'000.0 * 100.0));
 
     // Frame 1: no successor.
-    CHECK(m[1].frame_idx == 1);
+    CHECK(m[1].display_time == 1);
     CHECK(m[1].target_us == doctest::Approx(40.0));
     CHECK_FALSE(m[1].frame_interval_us.has_value());
     CHECK_FALSE(m[1].target_pct_of_frame.has_value());
@@ -349,10 +349,10 @@ TEST_CASE("ComputeMerge: unmatched pre / post rows are dropped silently") {
         Row(99, 1, 700, 800), // no pre counterpart
     };
     const auto m = ComputeMerge(pre, 1000, post, 1000);
-    // frame_idx 0 and 2 match. frame_idx 1 is pre-only, 99 is post-only.
+    // display_time 0 and 2 match. display_time 1 is pre-only, 99 is post-only.
     REQUIRE(m.size() == 2);
-    CHECK(m[0].frame_idx == 0);
-    CHECK(m[1].frame_idx == 2);
+    CHECK(m[0].display_time == 0);
+    CHECK(m[1].display_time == 2);
 }
 
 TEST_CASE("ComputeMerge: frame_interval computed per thread, not across") {
@@ -373,19 +373,19 @@ TEST_CASE("ComputeMerge: frame_interval computed per thread, not across") {
 
     // Sort order: thread 1 frames 0,1, then thread 2 frame 0.
     CHECK(m[0].thread_id == 1);
-    CHECK(m[0].frame_idx == 0);
+    CHECK(m[0].display_time == 0);
     CHECK(m[0].frame_interval_us.has_value());  // has successor in thread 1
 
     CHECK(m[1].thread_id == 1);
-    CHECK(m[1].frame_idx == 1);
+    CHECK(m[1].display_time == 1);
     CHECK_FALSE(m[1].frame_interval_us.has_value());  // last in thread 1
 
     CHECK(m[2].thread_id == 2);
-    CHECK(m[2].frame_idx == 0);
+    CHECK(m[2].display_time == 0);
     CHECK_FALSE(m[2].frame_interval_us.has_value());  // only one in thread 2
 }
 
-TEST_CASE("ComputeMerge: output sorted by (thread_id, frame_idx) regardless of input order") {
+TEST_CASE("ComputeMerge: output sorted by (thread_id, display_time) regardless of input order") {
     // Feed pre rows out of order; ComputeMerge must still emit thread-then-
     // frame ordering.
     const std::vector<RawFrameRow> pre = {
@@ -403,13 +403,13 @@ TEST_CASE("ComputeMerge: output sorted by (thread_id, frame_idx) regardless of i
     const auto m = ComputeMerge(pre, 1000, post, 1000);
     REQUIRE(m.size() == 4);
     CHECK(m[0].thread_id == 1);
-    CHECK(m[0].frame_idx == 0);
+    CHECK(m[0].display_time == 0);
     CHECK(m[1].thread_id == 1);
-    CHECK(m[1].frame_idx == 3);
+    CHECK(m[1].display_time == 3);
     CHECK(m[2].thread_id == 2);
-    CHECK(m[2].frame_idx == 0);
+    CHECK(m[2].display_time == 0);
     CHECK(m[3].thread_id == 2);
-    CHECK(m[3].frame_idx == 5);
+    CHECK(m[3].display_time == 5);
 }
 
 TEST_CASE("ComputeMerge: preFreq is authoritative for both sides (matches analyze.py)") {
@@ -430,7 +430,7 @@ TEST_CASE("ComputeMerge: preFreq is authoritative for both sides (matches analyz
 }
 
 TEST_CASE("ComputeMerge: duplicate pre rows do not double-count against a single post entry") {
-    // Two pre rows share the same (frame_idx, thread_id) -- defensive
+    // Two pre rows share the same (display_time, thread_id) -- defensive
     // against a future writer-thread retry or any other source of dupes.
     // The first match consumes the post entry; the second sees no match
     // and is dropped. Output count = matched pairs, never inflated.
@@ -487,7 +487,7 @@ TEST_CASE("ComputeStats: ms aggregates over every row, pct only over rows with p
     // frames total. Two have target_pct_of_frame, one (last per thread)
     // doesn't.
     std::vector<MergedRow> merged(3);
-    merged[0].frame_idx = 0;
+    merged[0].display_time = 0;
     merged[0].thread_id = 1;
     merged[0].pre_us = 100;
     merged[0].post_us = 60;
@@ -495,14 +495,14 @@ TEST_CASE("ComputeStats: ms aggregates over every row, pct only over rows with p
     merged[0].frame_interval_us = 11000.0;
     merged[0].target_pct_of_frame = 40.0 / 11000.0 * 100.0;
 
-    merged[1].frame_idx = 1;
+    merged[1].display_time = 1;
     merged[1].thread_id = 1;
     merged[1].pre_us = 80;
     merged[1].post_us = 70;
     merged[1].target_us = 10;
     // No successor on thread 1.
 
-    merged[2].frame_idx = 0;
+    merged[2].display_time = 0;
     merged[2].thread_id = 2;
     merged[2].pre_us = 200;
     merged[2].post_us = 50;
@@ -542,7 +542,7 @@ TEST_CASE("ComputeStats: negative target_us counted") {
 
 TEST_CASE("WriteMergedCsv: header has the eleven # lines + column line") {
     std::vector<MergedRow> merged(1);
-    merged[0].frame_idx = 0;
+    merged[0].display_time = 0;
     merged[0].thread_id = 12345;
     merged[0].pre_us = 100.0;
     merged[0].post_us = 50.0;
@@ -575,14 +575,14 @@ TEST_CASE("WriteMergedCsv: header has the eleven # lines + column line") {
     CHECK(s.find("# target_gpu_ms_min=0.0000\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_max=0.0000\n") != std::string::npos);
     // Column header gained the trailing target_gpu_us column.
-    CHECK(s.find("frame_idx,thread_id,frame_interval_us,pre_us,post_us,"
+    CHECK(s.find("display_time,thread_id,frame_interval_us,pre_us,post_us,"
                  "target_us,target_pct_of_frame,target_gpu_us\n") !=
           std::string::npos);
 }
 
 TEST_CASE("WriteMergedCsv: data row format matches the .3f/.4f contract") {
     std::vector<MergedRow> merged(2);
-    merged[0].frame_idx = 0;
+    merged[0].display_time = 0;
     merged[0].thread_id = 42;
     merged[0].pre_us = 1.234567;
     merged[0].post_us = 0.123456;
@@ -592,7 +592,7 @@ TEST_CASE("WriteMergedCsv: data row format matches the .3f/.4f contract") {
     merged[0].target_gpu_us = 12.345678;  // .3f -> "12.346"
 
     // Last row per thread: optionals blank, including target_gpu_us.
-    merged[1].frame_idx = 1;
+    merged[1].display_time = 1;
     merged[1].thread_id = 42;
     merged[1].pre_us = 2.000;
     merged[1].post_us = 1.000;
@@ -621,7 +621,7 @@ TEST_CASE("WriteMergedCsv: output uses LF line endings on disk via a binary ofst
     // could not catch a regression where someone drops the binary flag,
     // because ostringstream is mode-agnostic.
     std::vector<MergedRow> merged(1);
-    merged[0].frame_idx = 0;
+    merged[0].display_time = 0;
     merged[0].thread_id = 1;
     merged[0].pre_us = 1.0;
     merged[0].post_us = 0.0;
@@ -669,7 +669,7 @@ TEST_CASE("ReadGpuCsv: parses a well-formed GPU CSV") {
     const auto parsed = ReadGpuCsv(path);
     CHECK(parsed.header_valid);
     REQUIRE(parsed.rows.size() == 2);
-    CHECK(parsed.rows[0].frame_idx == 0);
+    CHECK(parsed.rows[0].display_time == 0);
     CHECK(parsed.rows[0].gpu_ticks == 10'000);
     CHECK(parsed.rows[0].gpu_freq == 1'000'000'000);
     CHECK(parsed.rows[0].valid == 1);
@@ -696,7 +696,7 @@ TEST_CASE("ReadGpuCsv: CRLF on the column header still validates") {
     {
         std::ofstream out(path, std::ios::out | std::ios::binary);
         out << "# gpu_clock=d3d11\r\n"
-            << "frame_idx,gpu_ticks,gpu_freq,valid\r\n"
+            << "display_time,gpu_ticks,gpu_freq,valid\r\n"
             << "0,123,456,1\r\n";
     }
     const auto parsed = ReadGpuCsv(path);
@@ -711,8 +711,8 @@ TEST_CASE("ReadGpuCsv: CRLF on the column header still validates") {
 
 TEST_CASE("JoinGpu: empty inputs leave every target_gpu_us blank") {
     std::vector<MergedRow> merged(2);
-    merged[0].frame_idx = 0; merged[0].thread_id = 1;
-    merged[1].frame_idx = 1; merged[1].thread_id = 1;
+    merged[0].display_time = 0; merged[0].thread_id = 1;
+    merged[1].display_time = 1; merged[1].thread_id = 1;
     JoinGpu(merged, {}, {});
     CHECK_FALSE(merged[0].target_gpu_us.has_value());
     CHECK_FALSE(merged[1].target_gpu_us.has_value());
@@ -721,7 +721,7 @@ TEST_CASE("JoinGpu: empty inputs leave every target_gpu_us blank") {
 TEST_CASE("JoinGpu: matched valid pair fills target_gpu_us") {
     // 1 GHz GPU clock -> 1 tick = 1 ns -> 1000 ticks = 1 us.
     std::vector<MergedRow> merged(1);
-    merged[0].frame_idx = 5;
+    merged[0].display_time = 5;
     merged[0].thread_id = 42;
     JoinGpu(merged,
             {GpuRow(5, 10'000, 1'000'000'000, 1)},
@@ -734,7 +734,7 @@ TEST_CASE("JoinGpu: a valid=0 row on either side blanks the frame") {
     // Pre invalid.
     {
         std::vector<MergedRow> merged(1);
-        merged[0].frame_idx = 0; merged[0].thread_id = 1;
+        merged[0].display_time = 0; merged[0].thread_id = 1;
         JoinGpu(merged,
                 {GpuRow(0, 10'000, 1'000'000'000, 0)},
                 {GpuRow(0, 15'000, 1'000'000'000, 1)});
@@ -743,7 +743,7 @@ TEST_CASE("JoinGpu: a valid=0 row on either side blanks the frame") {
     // Post invalid.
     {
         std::vector<MergedRow> merged(1);
-        merged[0].frame_idx = 0; merged[0].thread_id = 1;
+        merged[0].display_time = 0; merged[0].thread_id = 1;
         JoinGpu(merged,
                 {GpuRow(0, 10'000, 1'000'000'000, 1)},
                 {GpuRow(0, 15'000, 1'000'000'000, 0)});
@@ -755,7 +755,7 @@ TEST_CASE("JoinGpu: gpu_freq mismatch blanks the frame") {
     // Different reported clock rates mean the GPU clock was disjoint across
     // the measured span -- the delta would be meaningless.
     std::vector<MergedRow> merged(1);
-    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    merged[0].display_time = 0; merged[0].thread_id = 1;
     JoinGpu(merged,
             {GpuRow(0, 10'000, 1'000'000'000, 1)},
             {GpuRow(0, 15'000, 2'000'000'000, 1)});
@@ -764,7 +764,7 @@ TEST_CASE("JoinGpu: gpu_freq mismatch blanks the frame") {
 
 TEST_CASE("JoinGpu: gpu_freq == 0 blanks the frame") {
     std::vector<MergedRow> merged(1);
-    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    merged[0].display_time = 0; merged[0].thread_id = 1;
     JoinGpu(merged,
             {GpuRow(0, 10'000, 0, 1)},
             {GpuRow(0, 15'000, 0, 1)});
@@ -775,7 +775,7 @@ TEST_CASE("JoinGpu: post_ticks < pre_ticks (driver bug) blanks the frame") {
     // Treating the unsigned wrap of (post - pre) as the delta would
     // produce a huge bogus value. The join must refuse it.
     std::vector<MergedRow> merged(1);
-    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    merged[0].display_time = 0; merged[0].thread_id = 1;
     JoinGpu(merged,
             {GpuRow(0, 20'000, 1'000'000'000, 1)},
             {GpuRow(0, 10'000, 1'000'000'000, 1)});
@@ -784,8 +784,8 @@ TEST_CASE("JoinGpu: post_ticks < pre_ticks (driver bug) blanks the frame") {
 
 TEST_CASE("JoinGpu: a frame missing on one GPU side stays blank") {
     std::vector<MergedRow> merged(2);
-    merged[0].frame_idx = 0; merged[0].thread_id = 1;
-    merged[1].frame_idx = 1; merged[1].thread_id = 1;
+    merged[0].display_time = 0; merged[0].thread_id = 1;
+    merged[1].display_time = 1; merged[1].thread_id = 1;
     JoinGpu(merged,
             {GpuRow(0, 10'000, 1'000'000'000, 1)},    // only frame 0 pre
             {GpuRow(1, 15'000, 1'000'000'000, 1)});   // only frame 1 post
@@ -797,7 +797,7 @@ TEST_CASE("JoinGpu: ignores GPU rows that don't match any CPU merged row") {
     // GPU rows for frames the CPU side never saw must NOT crash or invent
     // rows -- they are simply ignored.
     std::vector<MergedRow> merged(1);
-    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    merged[0].display_time = 0; merged[0].thread_id = 1;
     JoinGpu(merged,
             {GpuRow(0, 10'000, 1'000'000'000, 1),
              GpuRow(999, 99'000, 1'000'000'000, 1)},
@@ -808,12 +808,12 @@ TEST_CASE("JoinGpu: ignores GPU rows that don't match any CPU merged row") {
     CHECK(merged.size() == 1);  // no new rows invented
 }
 
-TEST_CASE("JoinGpu: duplicate frame_idx in input resolves last-wins") {
+TEST_CASE("JoinGpu: duplicate display_time in input resolves last-wins") {
     // Matches std::map[key] = row on the C++ side and analyze.py's dict
     // comprehension. The contract is "later rows overwrite", not "first
     // wins".
     std::vector<MergedRow> merged(1);
-    merged[0].frame_idx = 0; merged[0].thread_id = 1;
+    merged[0].display_time = 0; merged[0].thread_id = 1;
     JoinGpu(merged,
             {GpuRow(0, 10'000, 1'000'000'000, 1),
              GpuRow(0, 12'000, 1'000'000'000, 1)},   // last-wins: 12000
@@ -831,7 +831,7 @@ TEST_CASE("ComputeStats: gpu aggregates over rows with target_gpu_us only") {
     std::vector<MergedRow> merged(3);
     // Three frames; first two have GPU samples, third doesn't.
     for (size_t i = 0; i < merged.size(); ++i) {
-        merged[i].frame_idx = static_cast<uint64_t>(i);
+        merged[i].display_time = static_cast<uint64_t>(i);
         merged[i].thread_id = 1;
         merged[i].pre_us = 100.0;
         merged[i].post_us = 50.0;

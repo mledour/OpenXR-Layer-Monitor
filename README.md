@@ -262,7 +262,7 @@ or remove the two HKLM values manually.
 
    | column                  | meaning |
    | ----------------------- | ------- |
-   | `frame_idx`             | matched index between pre and post |
+   | `display_time`          | frame's predicted display time (`XrTime`); the key matched between pre and post |
    | `thread_id`             | thread that called `xrEndFrame` |
    | `frame_interval_us`     | wall-clock between this and the next frame's pre-entry (blank on the last row) |
    | `pre_us`                | pre-side bracket = target + post + runtime |
@@ -379,9 +379,9 @@ CPU CSV format (header rows start with `#`):
 # side=pre
 # layer=XR_APILAYER_MLEDOUR_layer_monitor_pre
 # fn=xrEndFrame
-frame_idx,thread_id,qpc_entry,qpc_exit
-0,12345,17834950123456,17834950456789
-1,12345,17834951678901,17834951901234
+display_time,thread_id,qpc_entry,qpc_exit
+33724160000000,12345,17834950123456,17834950456789
+33724171111111,12345,17834951678901,17834951901234
 ...
 ```
 
@@ -401,9 +401,9 @@ matching what OpenXR Toolkit and fpsVR do).
 # side=pre
 # layer=XR_APILAYER_MLEDOUR_layer_monitor_pre
 # fn=xrEndFrame
-frame_idx,gpu_ticks,gpu_freq,valid
-0,1234567890,12000000,1
-1,1234580000,12000000,1
+display_time,gpu_ticks,gpu_freq,valid
+33724160000000,1234567890,12000000,1
+33724171111111,1234580000,12000000,1
 ...
 ```
 
@@ -443,7 +443,7 @@ column header, then one row per matched frame:
 # target_gpu_ms_mean=<float>         ms (over the gpu_frame_count subset only)
 # target_gpu_ms_min=<float>          ms
 # target_gpu_ms_max=<float>          ms
-frame_idx,thread_id,frame_interval_us,pre_us,post_us,target_us,target_pct_of_frame,target_gpu_us
+display_time,thread_id,frame_interval_us,pre_us,post_us,target_us,target_pct_of_frame,target_gpu_us
 <int>,<int>,<float>,<float>,<float>,<float>,<float>,<float>
 ...
 ```
