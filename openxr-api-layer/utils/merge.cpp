@@ -312,6 +312,18 @@ namespace openxr_api_layer::merge {
             return sum + c;
         }
 
+        // Mean (Kahan-Neumaier compensated) + min + max over a NON-EMPTY
+        // vector, written into the three out-params. A single source for the
+        // reduction so a change to the summation strategy cannot drift between
+        // the ms / pct / gpu stat groups below (mirrored by analyze.py's
+        // _summarize, which keeps the merged-CSV header byte-equivalent).
+        void Summarize(const std::vector<double>& v, double& mean, double& min,
+                       double& max) {
+            mean = KahanNeumaierSum(v) / v.size();
+            min = *std::min_element(v.begin(), v.end());
+            max = *std::max_element(v.begin(), v.end());
+        }
+
     } // namespace
 
     MergeStats ComputeStats(const std::vector<MergedRow>& merged) {
@@ -340,27 +352,18 @@ namespace openxr_api_layer::merge {
             }
         }
         // ms_values always non-empty because merged is non-empty.
-        stats.target_ms_mean = KahanNeumaierSum(ms_values) / ms_values.size();
-        stats.target_ms_min = *std::min_element(ms_values.begin(), ms_values.end());
-        stats.target_ms_max = *std::max_element(ms_values.begin(), ms_values.end());
+        Summarize(ms_values, stats.target_ms_mean, stats.target_ms_min,
+                  stats.target_ms_max);
         if (!pct_values.empty()) {
-            stats.target_pct_mean =
-                KahanNeumaierSum(pct_values) / pct_values.size();
-            stats.target_pct_min =
-                *std::min_element(pct_values.begin(), pct_values.end());
-            stats.target_pct_max =
-                *std::max_element(pct_values.begin(), pct_values.end());
+            Summarize(pct_values, stats.target_pct_mean, stats.target_pct_min,
+                      stats.target_pct_max);
         }
         // GPU aggregates over frames that have a valid target_gpu_us. Stays
         // zero (and gpu_frame_count == 0) on CPU-only sessions.
         stats.gpu_frame_count = gpu_ms_values.size();
         if (!gpu_ms_values.empty()) {
-            stats.target_gpu_ms_mean =
-                KahanNeumaierSum(gpu_ms_values) / gpu_ms_values.size();
-            stats.target_gpu_ms_min =
-                *std::min_element(gpu_ms_values.begin(), gpu_ms_values.end());
-            stats.target_gpu_ms_max =
-                *std::max_element(gpu_ms_values.begin(), gpu_ms_values.end());
+            Summarize(gpu_ms_values, stats.target_gpu_ms_mean,
+                      stats.target_gpu_ms_min, stats.target_gpu_ms_max);
         }
         return stats;
     }

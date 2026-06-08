@@ -137,6 +137,20 @@ namespace openxr_api_layer {
         std::atomic<uint32_t> g_skipNext{0};
         std::atomic<bool> g_monitoring{false};
 
+        // THE single definition of "did the current session record any
+        // frames?" -- the data-loss invariant the merge relies on.
+        // MergeIntoOutput's zero-frame guard skips writing the merged CSV when
+        // this is false; FrameCsvSink's lazy-open is the per-side counterpart
+        // (it defers truncating the per-side CSV until the first row arrives).
+        // Together, a session that records nothing leaves every prior file on
+        // disk untouched. (The deeper fix -- per-session output filenames, so a
+        // no-op session physically cannot overwrite a prior one's files -- is
+        // noted in commit b643964 and deliberately deferred to keep one file
+        // per PID.)
+        bool SessionRecordedFrames() {
+            return g_frameCounter.load(std::memory_order_acquire) > 0;
+        }
+
         // ---- Cross-DLL toggle sync ----------------------------------------
         //
         // Naive per-DLL polling does NOT work for the sandwich: pre and
@@ -894,17 +908,12 @@ namespace openxr_api_layer {
             const fs::path outCsv =
                 localAppData / fmt::format("frames-merged-{}.csv", pid);
 
-            // ZERO-FRAME GUARD: a parasitic toggle (accidental Ctrl+F9
-            // from another app fires the rising edge, user cancels with
-            // a second Ctrl+F9 before any xrEndFrame Append) MUST NOT
-            // remove the previous session's frames-merged-<pid>.csv
-            // from disk. With the FrameCsvSink lazy-open change, the
-            // per-side CSVs are also untouched in this case -- we mirror
-            // that by skipping the merge entirely here. g_frameCounter
-            // is reset to 0 on every ApplyToggle(true) and incremented
-            // only on real recorded frames, so g_frameCounter == 0 at
-            // toggle-OFF time means "this session never wrote a row".
-            if (g_frameCounter.load(std::memory_order_acquire) == 0) {
+            // ZERO-FRAME GUARD: a parasitic toggle (an accidental Ctrl+F9 from
+            // another app, cancelled by a second press before any xrEndFrame
+            // Append) recorded nothing, so skip the merge and leave the
+            // previous frames-merged-<pid>.csv untouched. See
+            // SessionRecordedFrames() above for the shared data-loss invariant.
+            if (!SessionRecordedFrames()) {
                 Log("Skipping merge: this session recorded zero frames "
                     "(parasitic toggle, or xrDestroyInstance fired before "
                     "any xrEndFrame). Previous frames-merged-<pid>.csv "
