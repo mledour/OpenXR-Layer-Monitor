@@ -158,19 +158,12 @@
          already includes gpu_timer.cpp, but the test binary builds its own
          link unit, so we add the entry here too. -->
     <ClCompile Include="..\openxr-api-layer\utils\gpu_timer.cpp" />
-    <!-- Same reason as gpu_timer.cpp: synthetic_load.cpp defines
-         MakeSyntheticGpuLoad, which layer.cpp's xrCreateSession references
-         (the TEMPORARY D3D12 additivity-validation harness). The test binary
-         is its own link unit, so it needs the .cpp too. Remove this entry when
-         the harness is deleted. -->
-    <ClCompile Include="..\openxr-api-layer\utils\synthetic_load.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="external\doctest\doctest.h" />
     <ClInclude Include="mock_runtime.h" />
     <ClInclude Include="..\openxr-api-layer\utils\merge.h" />
     <ClInclude Include="..\openxr-api-layer\utils\gpu_timer.h" />
-    <ClInclude Include="..\openxr-api-layer\utils\synthetic_load.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />

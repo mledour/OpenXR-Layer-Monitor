@@ -68,12 +68,6 @@
 // stays free of D3D query plumbing.
 #include "utils/gpu_timer.h"
 
-// TEMPORARY -- D3D12 additivity-validation harness (see synthetic_load.h).
-// Compiled into both sides but instantiated only on PRE, and only when
-// MLEDOUR_GPULOAD_ITERS is set. Delete this include and the g_synthLoad
-// call sites once the calibrate-and-subtract question is decided.
-#include "utils/synthetic_load.h"
-
 namespace openxr_api_layer {
 
     using namespace log;
@@ -763,99 +757,6 @@ namespace openxr_api_layer {
         std::mutex g_gpuTimerMutex;
         std::unique_ptr<gpu::IGpuTimer> g_gpuTimer;
 
-        // ---- Synthetic GPU load: D3D12 additivity-validation harness -------
-        // TEMPORARY. PRE side only, frame-thread only, OFF unless the env var
-        // MLEDOUR_GPULOAD_ITERS is set. Injects a self-timed copy loop between
-        // T_pre and T_post so the merge's target_gpu_us = K + O, with K written
-        // to gpuload-<pid>.csv. scripts/validate_additivity.py joins the two.
-        // No mutex: unlike g_gpuTimer, this is never read by the CSV writer
-        // thread -- only the render thread (xrCreateSession / xrEndFrame /
-        // xrDestroySession) touches it. Delete this block + its call sites
-        // once additivity is decided.
-        std::unique_ptr<load::SyntheticGpuLoad> g_synthLoad;
-        std::vector<load::LoadRow> g_synthRows;  // accumulated; flushed at teardown
-
-        // True iff MLEDOUR_GPULOAD_ITERS is SET (even to 0 -- a valid control
-        // run measuring the bare overhead). itersOut receives the parsed count.
-        bool SyntheticLoadEnabled(uint64_t& itersOut) {
-            char buf[32];
-            const DWORD n = GetEnvironmentVariableA(
-                "MLEDOUR_GPULOAD_ITERS", buf, sizeof(buf));
-            if (n == 0 || n >= sizeof(buf)) {
-                return false;  // unset / oversized
-            }
-            try {
-                size_t pos = 0;
-                const unsigned long long v = std::stoull(buf, &pos);
-                if (pos == n) {
-                    itersOut = static_cast<uint64_t>(v);
-                    return true;
-                }
-            } catch (...) {
-            }
-            return false;  // malformed
-        }
-
-        // Per-copy buffer size; MLEDOUR_GPULOAD_BYTES overrides the 8 MiB
-        // default. Absolute value is irrelevant (each frame self-times K) --
-        // it just sets the granularity of the iteration knob.
-        uint64_t SyntheticLoadBytes() {
-            char buf[32];
-            const DWORD n = GetEnvironmentVariableA(
-                "MLEDOUR_GPULOAD_BYTES", buf, sizeof(buf));
-            if (n != 0 && n < sizeof(buf)) {
-                try {
-                    size_t pos = 0;
-                    const unsigned long long v = std::stoull(buf, &pos);
-                    if (pos == n && v > 0) {
-                        return static_cast<uint64_t>(v);
-                    }
-                } catch (...) {
-                }
-            }
-            return 8ull * 1024 * 1024;
-        }
-
-        // Write the accumulated K rows to gpuload-<pid>.csv (binary so the '\n'
-        // survives MSVC text-mode translation), mirroring the GPU CSV header
-        // style. Touches no D3D object, so it is safe even after the session's
-        // device is gone. Called at Ctrl+F9-OFF (the primary path, alongside
-        // the frame/GPU CSV finalize + merge) and again at xrDestroySession /
-        // dtor as a fallback. Idempotent: re-flushing the same rows just
-        // rewrites the file. Logs the outcome (only ever called off the
-        // per-frame hot path, so Log() is allowed here).
-        void FlushSyntheticLoadCsv() {
-            if (!g_synthLoad || localAppData.empty()) {
-                return;
-            }
-            if (g_synthRows.empty()) {
-                Log("Synthetic load: nothing to flush (0 K rows resolved this "
-                    "session -- if the harness was active, this points to a "
-                    "PollResolved/submission problem, not a flush-timing one)\n");
-                return;
-            }
-            const auto pid = GetCurrentProcessId();
-            const auto path = localAppData / fmt::format("gpuload-{}.csv", pid);
-            std::ofstream s(path, std::ios::binary | std::ios::trunc);
-            if (!s) {
-                ErrorLog(fmt::format(
-                    "Synthetic load: could not open {} for writing\n",
-                    path.string()));
-                return;
-            }
-            s << "# gpu_clock=d3d12\n"
-              << "# iters=" << g_synthLoad->Iterations() << "\n"
-              << "# fn=xrEndFrame\n"
-              << "display_time,known_ticks,gpu_freq,valid\n";
-            for (const auto& r : g_synthRows) {
-                s << r.display_time << ',' << r.known_ticks << ','
-                  << r.gpu_freq << ',' << r.valid << '\n';
-            }
-            Log(fmt::format(
-                "Synthetic load: wrote {} K rows to gpuload-{}.csv\n",
-                g_synthRows.size(), pid));
-        }
-
         // Writer-thread accessors. Const char* return is safe because every
         // backend's BackendName() returns a static string literal; uint64_t
         // is copied out under the lock. Callers MUST NOT cache the returned
@@ -1246,31 +1147,12 @@ namespace openxr_api_layer {
                 if (g_gpuTimer) {
                     g_gpuTimer->Reset();
                 }
-                // TEMPORARY additivity harness: reset the K accumulator for the
-                // new monitoring period, matching g_csv's truncate-on-Start so
-                // the gpuload CSV covers only this Ctrl+F9 on->off window.
-                if constexpr (kIsPreSide) {
-                    g_synthRows.clear();
-                }
             } else {
                 g_csv.Stop();     // noexcept; catches its own join exceptions
                 // Recover any GPU timestamps the timer resolved but the
                 // per-frame drain never picked up, before closing the sink.
                 DrainResolvedGpuOnce();
                 g_gpuCsv.Stop();  // noexcept; flush the GPU CSV before merge
-                // TEMPORARY additivity harness: flush gpuload-<pid>.csv HERE,
-                // at the same Ctrl+F9-OFF point the frame/GPU CSVs are finalized
-                // and the merge runs. Tying the flush ONLY to xrDestroySession
-                // lost the file whenever the app was killed after stopping
-                // monitoring -- the frame CSVs survive because they're written
-                // live by the writer thread and merged here, so the K CSV must
-                // be finalized at the same instant.
-                if constexpr (kIsPreSide) {
-                    if (g_synthLoad) {
-                        g_synthLoad->PollResolved(g_synthRows);
-                        FlushSyntheticLoadCsv();
-                    }
-                }
                 if constexpr (kIsPostSide) {
                     // Post is downstream, so by the time we reach this
                     // line pre's ApplyToggle has already returned -- which
@@ -1344,14 +1226,6 @@ namespace openxr_api_layer {
         // xrDestroyInstance. Everything that can throw is wrapped, and
         // g_csv.Stop() / g_gpuCsv.Stop() are themselves declared noexcept.
         ~OpenXrLayer() override {
-            // TEMPORARY additivity harness fallback: if the app tore down the
-            // instance without destroying the session first, flush the
-            // accumulated K rows here (in-memory only, no device needed).
-            // No-op if xrDestroySession already flushed and reset the load.
-            if constexpr (kIsPreSide) {
-                FlushSyntheticLoadCsv();
-                g_synthLoad.reset();
-            }
             if (!g_monitoring.load(std::memory_order_acquire)) {
                 // Either: user pressed Ctrl+F9 to stop, and the merge
                 // already happened on that toggle; or: user never started
@@ -1528,32 +1402,6 @@ namespace openxr_api_layer {
                 Log("No D3D11 or D3D12 binding in xrCreateSession (Vulkan / "
                     "OpenGL host); GPU monitoring off, CPU monitoring active\n");
             }
-
-            // TEMPORARY additivity-validation harness. PRE side, D3D12 only,
-            // OFF unless MLEDOUR_GPULOAD_ITERS is set. Rebuilt per session like
-            // the timer above; a no-op everywhere else.
-            if constexpr (kIsPreSide) {
-                g_synthLoad.reset();
-                uint64_t iters = 0;
-                if (d3d12 && SyntheticLoadEnabled(iters)) {
-                    const uint64_t bytes = SyntheticLoadBytes();
-                    g_synthLoad = load::MakeSyntheticGpuLoad(
-                        d3d12->device, d3d12->queue, iters, bytes);
-                    if (g_synthLoad) {
-                        g_synthRows.clear();
-                        // ~12 min at 90 Hz; sized so the per-frame PollResolved
-                        // append never reallocates on the render thread.
-                        g_synthRows.reserve(65536);
-                        Log(fmt::format(
-                            "SYNTHETIC GPU LOAD active: {} copies/frame of {} "
-                            "bytes (additivity harness -> gpuload-<pid>.csv)\n",
-                            iters, bytes));
-                    } else {
-                        Log("Synthetic GPU load requested (MLEDOUR_GPULOAD_ITERS "
-                            "set) but creation failed; continuing without it\n");
-                    }
-                }
-            }
             return result;
         }
 
@@ -1570,18 +1418,6 @@ namespace openxr_api_layer {
             TraceLoggingWrite(g_traceProvider,
                               "xrDestroySession",
                               TLArg(kSideStr, "Side"));
-
-            // TEMPORARY additivity harness: drain the resolved tail and flush
-            // gpuload-<pid>.csv while the session's device is still alive
-            // (before forwarding below), then drop the load. No-op when off.
-            if constexpr (kIsPreSide) {
-                if (g_synthLoad) {
-                    g_synthLoad->PollResolved(g_synthRows);
-                    FlushSyntheticLoadCsv();
-                    g_synthLoad.reset();
-                }
-            }
-
             // Lock against the GPU CSV writer thread reading g_gpuTimer for
             // the "# gpu_clock=" header or the "# session_end gpu_ring_
             // overflow=" footer line. Without the lock, an app that destroys
@@ -1697,15 +1533,6 @@ namespace openxr_api_layer {
                     g_gpuTimer->RecordTimestamp(display_time);
                 }
 
-                // TEMPORARY additivity harness: submit the self-timed copy
-                // loop AFTER T_pre and BEFORE forwarding, so on the app queue
-                // it lands between T_pre and T_post. Kept OUTSIDE the narrow
-                // bracket below so its CPU submission cost never enters
-                // target_us (we care only about its GPU placement).
-                if (g_synthLoad) {
-                    g_synthLoad->RecordAndTime(display_time);
-                }
-
                 // Narrow bracket -- pre's own work is OUTSIDE.
                 const int64_t qpc_entry = Qpc();
                 const XrResult result =
@@ -1724,9 +1551,6 @@ namespace openxr_api_layer {
                 // Drain resolved GPU timestamps AFTER qpc_exit (outside the
                 // narrow bracket) so the GetData polls never inflate target_us.
                 DrainGpu();
-                if (g_synthLoad) {
-                    g_synthLoad->PollResolved(g_synthRows);
-                }
                 return result;
             } else {
                 // -------- POST side (wide bracket) --------
