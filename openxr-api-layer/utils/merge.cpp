@@ -232,7 +232,7 @@ namespace openxr_api_layer::merge {
                 // mislead any tool that divides by it.
                 if (fiv > 0.0) {
                     m.frame_interval_us = fiv;
-                    m.target_pct_of_frame = m.target_us / fiv * 100.0;
+                    m.target_cpu_pct_of_frame = m.target_us / fiv * 100.0;
                 }
             }
             merged.push_back(m);
@@ -285,6 +285,14 @@ namespace openxr_api_layer::merge {
             const uint64_t deltaTicks = post.gpu_ticks - pre.gpu_ticks;
             m.target_gpu_us = static_cast<double>(deltaTicks) /
                               static_cast<double>(pre.gpu_freq) * 1e6;
+            // GPU duration as a % of the frame interval, mirroring the CPU
+            // target_cpu_pct_of_frame. Only when this frame has an interval
+            // (every frame except the last per thread); ComputeMerge already
+            // guaranteed frame_interval_us > 0 when it is set.
+            if (m.frame_interval_us.has_value()) {
+                m.target_gpu_pct_of_frame =
+                    *m.target_gpu_us / *m.frame_interval_us * 100.0;
+            }
         }
     }
 
@@ -335,35 +343,45 @@ namespace openxr_api_layer::merge {
         std::vector<double> ms_values;
         std::vector<double> pct_values;
         std::vector<double> gpu_ms_values;
+        std::vector<double> gpu_pct_values;
         ms_values.reserve(merged.size());
         pct_values.reserve(merged.size());
         gpu_ms_values.reserve(merged.size());
+        gpu_pct_values.reserve(merged.size());
         for (const auto& m : merged) {
             const double ms = m.target_us / 1000.0;
             ms_values.push_back(ms);
             if (ms < 0.0) {
                 ++stats.negative_target_count;
             }
-            if (m.target_pct_of_frame.has_value()) {
-                pct_values.push_back(*m.target_pct_of_frame);
+            if (m.target_cpu_pct_of_frame.has_value()) {
+                pct_values.push_back(*m.target_cpu_pct_of_frame);
             }
             if (m.target_gpu_us.has_value()) {
                 gpu_ms_values.push_back(*m.target_gpu_us / 1000.0);
             }
+            if (m.target_gpu_pct_of_frame.has_value()) {
+                gpu_pct_values.push_back(*m.target_gpu_pct_of_frame);
+            }
         }
         // ms_values always non-empty because merged is non-empty.
-        Summarize(ms_values, stats.target_ms_mean, stats.target_ms_min,
-                  stats.target_ms_max);
+        Summarize(ms_values, stats.target_cpu_ms_mean, stats.target_cpu_ms_min,
+                  stats.target_cpu_ms_max);
         if (!pct_values.empty()) {
-            Summarize(pct_values, stats.target_pct_mean, stats.target_pct_min,
-                      stats.target_pct_max);
+            Summarize(pct_values, stats.target_cpu_pct_mean,
+                      stats.target_cpu_pct_min, stats.target_cpu_pct_max);
         }
         // GPU aggregates over frames that have a valid target_gpu_us. Stays
-        // zero (and gpu_frame_count == 0) on CPU-only sessions.
+        // zero (and gpu_frame_count == 0) on CPU-only sessions. The pct subset
+        // also requires a frame_interval (last frame per thread has none).
         stats.gpu_frame_count = gpu_ms_values.size();
         if (!gpu_ms_values.empty()) {
             Summarize(gpu_ms_values, stats.target_gpu_ms_mean,
                       stats.target_gpu_ms_min, stats.target_gpu_ms_max);
+        }
+        if (!gpu_pct_values.empty()) {
+            Summarize(gpu_pct_values, stats.target_gpu_pct_mean,
+                      stats.target_gpu_pct_min, stats.target_gpu_pct_max);
         }
         return stats;
     }
@@ -377,18 +395,21 @@ namespace openxr_api_layer::merge {
         // already go through fmt (locale-independent).
         out.imbue(std::locale::classic());
         out << "# frame_count=" << stats.frame_count << '\n'
-            << "# target_ms_mean=" << fmt::format("{:.4f}", stats.target_ms_mean) << '\n'
-            << "# target_ms_min="  << fmt::format("{:.4f}", stats.target_ms_min)  << '\n'
-            << "# target_ms_max="  << fmt::format("{:.4f}", stats.target_ms_max)  << '\n'
-            << "# target_pct_mean=" << fmt::format("{:.4f}", stats.target_pct_mean) << "%\n"
-            << "# target_pct_min="  << fmt::format("{:.4f}", stats.target_pct_min)  << "%\n"
-            << "# target_pct_max="  << fmt::format("{:.4f}", stats.target_pct_max)  << "%\n"
+            << "# target_cpu_ms_mean=" << fmt::format("{:.4f}", stats.target_cpu_ms_mean) << '\n'
+            << "# target_cpu_ms_min="  << fmt::format("{:.4f}", stats.target_cpu_ms_min)  << '\n'
+            << "# target_cpu_ms_max="  << fmt::format("{:.4f}", stats.target_cpu_ms_max)  << '\n'
+            << "# target_cpu_pct_mean=" << fmt::format("{:.4f}", stats.target_cpu_pct_mean) << "%\n"
+            << "# target_cpu_pct_min="  << fmt::format("{:.4f}", stats.target_cpu_pct_min)  << "%\n"
+            << "# target_cpu_pct_max="  << fmt::format("{:.4f}", stats.target_cpu_pct_max)  << "%\n"
             << "# target_gpu_frame_count=" << stats.gpu_frame_count << '\n'
             << "# target_gpu_ms_mean=" << fmt::format("{:.4f}", stats.target_gpu_ms_mean) << '\n'
             << "# target_gpu_ms_min="  << fmt::format("{:.4f}", stats.target_gpu_ms_min)  << '\n'
             << "# target_gpu_ms_max="  << fmt::format("{:.4f}", stats.target_gpu_ms_max)  << '\n'
+            << "# target_gpu_pct_mean=" << fmt::format("{:.4f}", stats.target_gpu_pct_mean) << "%\n"
+            << "# target_gpu_pct_min="  << fmt::format("{:.4f}", stats.target_gpu_pct_min)  << "%\n"
+            << "# target_gpu_pct_max="  << fmt::format("{:.4f}", stats.target_gpu_pct_max)  << "%\n"
             << "display_time,thread_id,frame_interval_us,pre_us,post_us,target_us,"
-               "target_pct_of_frame,target_gpu_us\n";
+               "target_cpu_pct_of_frame,target_gpu_us,target_gpu_pct_of_frame\n";
         for (const auto& m : merged) {
             out << m.display_time << ',' << m.thread_id << ',';
             if (m.frame_interval_us.has_value()) {
@@ -397,12 +418,16 @@ namespace openxr_api_layer::merge {
             out << ',' << fmt::format("{:.3f}", m.pre_us) << ','
                 << fmt::format("{:.3f}", m.post_us) << ','
                 << fmt::format("{:.3f}", m.target_us) << ',';
-            if (m.target_pct_of_frame.has_value()) {
-                out << fmt::format("{:.4f}", *m.target_pct_of_frame);
+            if (m.target_cpu_pct_of_frame.has_value()) {
+                out << fmt::format("{:.4f}", *m.target_cpu_pct_of_frame);
             }
             out << ',';
             if (m.target_gpu_us.has_value()) {
                 out << fmt::format("{:.3f}", *m.target_gpu_us);
+            }
+            out << ',';
+            if (m.target_gpu_pct_of_frame.has_value()) {
+                out << fmt::format("{:.4f}", *m.target_gpu_pct_of_frame);
             }
             out << '\n';
         }

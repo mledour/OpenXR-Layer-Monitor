@@ -239,9 +239,9 @@ TEST_CASE("ReadFrameCsv: header_valid is false when the column header does not "
     {
         std::ofstream out(path);
         out << "# frame_count=42\n"
-            << "# target_ms_mean=0.0123\n"
+            << "# target_cpu_ms_mean=0.0123\n"
             << "display_time,thread_id,frame_interval_us,pre_us,post_us,"
-               "target_us,target_pct_of_frame,target_gpu_us\n"
+               "target_us,target_cpu_pct_of_frame,target_gpu_us\n"
             << "0,1,11100.000,1.234,0.123,1.111,0.0100,5.000\n";
     }
     const auto parsed = ReadFrameCsv(path, /*defaultFreq=*/10'000'000);
@@ -303,7 +303,7 @@ TEST_CASE("ComputeMerge: single matched pair, no successor leaves interval blank
     CHECK(m[0].post_us == doctest::Approx(800.0));
     CHECK(m[0].target_us == doctest::Approx(200.0));
     CHECK_FALSE(m[0].frame_interval_us.has_value());
-    CHECK_FALSE(m[0].target_pct_of_frame.has_value());
+    CHECK_FALSE(m[0].target_cpu_pct_of_frame.has_value());
 }
 
 TEST_CASE("ComputeMerge: two frames same thread, first row has interval second has none") {
@@ -327,15 +327,15 @@ TEST_CASE("ComputeMerge: two frames same thread, first row has interval second h
     CHECK(m[0].target_us == doctest::Approx(50.0));
     REQUIRE(m[0].frame_interval_us.has_value());
     CHECK(*m[0].frame_interval_us == doctest::Approx(111'000.0));
-    REQUIRE(m[0].target_pct_of_frame.has_value());
-    CHECK(*m[0].target_pct_of_frame ==
+    REQUIRE(m[0].target_cpu_pct_of_frame.has_value());
+    CHECK(*m[0].target_cpu_pct_of_frame ==
           doctest::Approx(50.0 / 111'000.0 * 100.0));
 
     // Frame 1: no successor.
     CHECK(m[1].display_time == 1);
     CHECK(m[1].target_us == doctest::Approx(40.0));
     CHECK_FALSE(m[1].frame_interval_us.has_value());
-    CHECK_FALSE(m[1].target_pct_of_frame.has_value());
+    CHECK_FALSE(m[1].target_cpu_pct_of_frame.has_value());
 }
 
 TEST_CASE("ComputeMerge: unmatched pre / post rows are dropped silently") {
@@ -464,7 +464,7 @@ TEST_CASE("ComputeMerge: non-positive frame_interval leaves the interval + pct b
     // First row (frame 0) has a NEGATIVE interval (900 - 1000 = -100).
     // Both interval and pct must be blank, NOT a negative number.
     CHECK_FALSE(m[0].frame_interval_us.has_value());
-    CHECK_FALSE(m[0].target_pct_of_frame.has_value());
+    CHECK_FALSE(m[0].target_cpu_pct_of_frame.has_value());
     // Second row (frame 1) is last per thread -> also blank, as before.
     CHECK_FALSE(m[1].frame_interval_us.has_value());
 }
@@ -476,16 +476,16 @@ TEST_CASE("ComputeMerge: non-positive frame_interval leaves the interval + pct b
 TEST_CASE("ComputeStats: empty merged gives all zeros") {
     const auto stats = ComputeStats({});
     CHECK(stats.frame_count == 0);
-    CHECK(stats.target_ms_mean == 0.0);
-    CHECK(stats.target_ms_min == 0.0);
-    CHECK(stats.target_ms_max == 0.0);
-    CHECK(stats.target_pct_mean == 0.0);
+    CHECK(stats.target_cpu_ms_mean == 0.0);
+    CHECK(stats.target_cpu_ms_min == 0.0);
+    CHECK(stats.target_cpu_ms_max == 0.0);
+    CHECK(stats.target_cpu_pct_mean == 0.0);
     CHECK(stats.negative_target_count == 0);
 }
 
 TEST_CASE("ComputeStats: ms aggregates over every row, pct only over rows with pct") {
     // Build merged rows directly (skip ComputeMerge). Two threads, three
-    // frames total. Two have target_pct_of_frame, one (last per thread)
+    // frames total. Two have target_cpu_pct_of_frame, one (last per thread)
     // doesn't.
     std::vector<MergedRow> merged(3);
     merged[0].display_time = 0;
@@ -494,7 +494,7 @@ TEST_CASE("ComputeStats: ms aggregates over every row, pct only over rows with p
     merged[0].post_us = 60;
     merged[0].target_us = 40;
     merged[0].frame_interval_us = 11000.0;
-    merged[0].target_pct_of_frame = 40.0 / 11000.0 * 100.0;
+    merged[0].target_cpu_pct_of_frame = 40.0 / 11000.0 * 100.0;
 
     merged[1].display_time = 1;
     merged[1].thread_id = 1;
@@ -512,16 +512,16 @@ TEST_CASE("ComputeStats: ms aggregates over every row, pct only over rows with p
 
     const auto stats = ComputeStats(merged);
     CHECK(stats.frame_count == 3);
-    // target_ms_*: 0.040, 0.010, 0.150 ms.
-    CHECK(stats.target_ms_mean == doctest::Approx((0.040 + 0.010 + 0.150) / 3.0));
-    CHECK(stats.target_ms_min == doctest::Approx(0.010));
-    CHECK(stats.target_ms_max == doctest::Approx(0.150));
-    // target_pct_*: only frame 0/thread 1 contributes.
-    CHECK(stats.target_pct_mean ==
+    // target_cpu_ms_*: 0.040, 0.010, 0.150 ms.
+    CHECK(stats.target_cpu_ms_mean == doctest::Approx((0.040 + 0.010 + 0.150) / 3.0));
+    CHECK(stats.target_cpu_ms_min == doctest::Approx(0.010));
+    CHECK(stats.target_cpu_ms_max == doctest::Approx(0.150));
+    // target_cpu_pct_*: only frame 0/thread 1 contributes.
+    CHECK(stats.target_cpu_pct_mean ==
           doctest::Approx(40.0 / 11000.0 * 100.0));
-    CHECK(stats.target_pct_min ==
+    CHECK(stats.target_cpu_pct_min ==
           doctest::Approx(40.0 / 11000.0 * 100.0));
-    CHECK(stats.target_pct_max ==
+    CHECK(stats.target_cpu_pct_max ==
           doctest::Approx(40.0 / 11000.0 * 100.0));
     CHECK(stats.negative_target_count == 0);
 }
@@ -533,15 +533,15 @@ TEST_CASE("ComputeStats: negative target_us counted") {
     merged[2].target_us = -10.0;
     const auto stats = ComputeStats(merged);
     CHECK(stats.negative_target_count == 2);
-    CHECK(stats.target_ms_min == doctest::Approx(-0.050));
-    CHECK(stats.target_ms_max == doctest::Approx(0.100));
+    CHECK(stats.target_cpu_ms_min == doctest::Approx(-0.050));
+    CHECK(stats.target_cpu_ms_max == doctest::Approx(0.100));
 }
 
 // ============================================================================
 // WriteMergedCsv
 // ============================================================================
 
-TEST_CASE("WriteMergedCsv: header has the eleven # lines + column line") {
+TEST_CASE("WriteMergedCsv: header has the fourteen # lines + column line") {
     std::vector<MergedRow> merged(1);
     merged[0].display_time = 0;
     merged[0].thread_id = 12345;
@@ -549,9 +549,9 @@ TEST_CASE("WriteMergedCsv: header has the eleven # lines + column line") {
     merged[0].post_us = 50.0;
     merged[0].target_us = 50.0;
     merged[0].frame_interval_us = 11100.0;
-    merged[0].target_pct_of_frame = 50.0 / 11100.0 * 100.0;
+    merged[0].target_cpu_pct_of_frame = 50.0 / 11100.0 * 100.0;
     // No target_gpu_us on this row -- exercises the CPU-only-session path
-    // where the four GPU header lines must still appear (with zeros) so the
+    // where the seven GPU header lines must still appear (with zeros) so the
     // merged-CSV schema stays uniform across D3D11 / non-D3D11 sessions.
 
     const auto stats = ComputeStats(merged);
@@ -559,25 +559,30 @@ TEST_CASE("WriteMergedCsv: header has the eleven # lines + column line") {
     WriteMergedCsv(out, merged, stats);
 
     const std::string s = out.str();
-    // 7 CPU stat lines + 4 GPU stat lines + 1 column header + 1 data row.
+    // 7 CPU stat lines + 7 GPU stat lines + 1 column header + 1 data row.
     INFO("Full output:\n" << s);
     CHECK(s.find("# frame_count=1\n") != std::string::npos);
-    CHECK(s.find("# target_ms_mean=0.0500\n") != std::string::npos);
-    CHECK(s.find("# target_ms_min=0.0500\n") != std::string::npos);
-    CHECK(s.find("# target_ms_max=0.0500\n") != std::string::npos);
+    CHECK(s.find("# target_cpu_ms_mean=0.0500\n") != std::string::npos);
+    CHECK(s.find("# target_cpu_ms_min=0.0500\n") != std::string::npos);
+    CHECK(s.find("# target_cpu_ms_max=0.0500\n") != std::string::npos);
     // pct lines carry the '%' suffix (per the user request).
-    CHECK(s.find("# target_pct_mean=0.4505%\n") != std::string::npos);
-    CHECK(s.find("# target_pct_min=0.4505%\n") != std::string::npos);
-    CHECK(s.find("# target_pct_max=0.4505%\n") != std::string::npos);
+    CHECK(s.find("# target_cpu_pct_mean=0.4505%\n") != std::string::npos);
+    CHECK(s.find("# target_cpu_pct_min=0.4505%\n") != std::string::npos);
+    CHECK(s.find("# target_cpu_pct_max=0.4505%\n") != std::string::npos);
     // GPU block: no rows have target_gpu_us, so the count is 0 and the
-    // ms_* aggregates round to 0.0000. No '%' suffix on the GPU ms lines.
+    // ms_*/pct_* aggregates round to 0.0000. The ms lines carry no '%'
+    // suffix; the pct lines do.
     CHECK(s.find("# target_gpu_frame_count=0\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_mean=0.0000\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_min=0.0000\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_max=0.0000\n") != std::string::npos);
-    // Column header gained the trailing target_gpu_us column.
+    CHECK(s.find("# target_gpu_pct_mean=0.0000%\n") != std::string::npos);
+    CHECK(s.find("# target_gpu_pct_min=0.0000%\n") != std::string::npos);
+    CHECK(s.find("# target_gpu_pct_max=0.0000%\n") != std::string::npos);
+    // Column header gained the target_gpu_us + target_gpu_pct_of_frame columns.
     CHECK(s.find("display_time,thread_id,frame_interval_us,pre_us,post_us,"
-                 "target_us,target_pct_of_frame,target_gpu_us\n") !=
+                 "target_us,target_cpu_pct_of_frame,target_gpu_us,"
+                 "target_gpu_pct_of_frame\n") !=
           std::string::npos);
 }
 
@@ -589,30 +594,32 @@ TEST_CASE("WriteMergedCsv: data row format matches the .3f/.4f contract") {
     merged[0].post_us = 0.123456;
     merged[0].target_us = 1.111111;
     merged[0].frame_interval_us = 11111.555;
-    merged[0].target_pct_of_frame = 0.01000;
+    merged[0].target_cpu_pct_of_frame = 0.01000;
     merged[0].target_gpu_us = 12.345678;  // .3f -> "12.346"
+    merged[0].target_gpu_pct_of_frame = 0.05000;  // .4f -> "0.0500"
 
-    // Last row per thread: optionals blank, including target_gpu_us.
+    // Last row per thread: optionals blank, including both GPU columns.
     merged[1].display_time = 1;
     merged[1].thread_id = 42;
     merged[1].pre_us = 2.000;
     merged[1].post_us = 1.000;
     merged[1].target_us = 1.000;
-    // frame_interval_us / target_pct_of_frame / target_gpu_us stay nullopt.
+    // frame_interval_us / target_cpu_pct_of_frame / target_gpu_us /
+    // target_gpu_pct_of_frame stay nullopt.
 
     const auto stats = ComputeStats(merged);
     std::ostringstream out;
     WriteMergedCsv(out, merged, stats);
 
     const std::string s = out.str();
-    // Row with all eight cells populated: .3f on the GPU column too, ending
-    // on a newline (no trailing comma at end-of-line).
-    CHECK(s.find("0,42,11111.555,1.235,0.123,1.111,0.0100,12.346\n") !=
+    // Row with all nine cells populated: .3f on the GPU duration, .4f on the
+    // GPU pct, ending on a newline (no trailing comma at end-of-line).
+    CHECK(s.find("0,42,11111.555,1.235,0.123,1.111,0.0100,12.346,0.0500\n") !=
           std::string::npos);
-    // Last row: empty frame_interval_us AND empty target_pct_of_frame AND
-    // empty target_gpu_us -- three blank cells, two trailing commas before
-    // the newline.
-    CHECK(s.find("1,42,,2.000,1.000,1.000,,\n") != std::string::npos);
+    // Last row: empty frame_interval_us, target_cpu_pct_of_frame,
+    // target_gpu_us AND target_gpu_pct_of_frame -- four blank cells, three
+    // trailing commas before the newline.
+    CHECK(s.find("1,42,,2.000,1.000,1.000,,,\n") != std::string::npos);
 }
 
 TEST_CASE("WriteMergedCsv: output uses LF line endings on disk via a binary ofstream") {
@@ -841,12 +848,19 @@ TEST_CASE("ComputeStats: gpu aggregates over rows with target_gpu_us only") {
     merged[0].target_gpu_us = 5'000.0;   // 5.0 ms
     merged[1].target_gpu_us = 8'000.0;   // 8.0 ms
     // merged[2].target_gpu_us stays nullopt -- excluded from GPU stats.
+    // GPU pct is its own subset (a frame also needs an interval); give the
+    // two GPU frames a pct and leave the third without.
+    merged[0].target_gpu_pct_of_frame = 10.0;
+    merged[1].target_gpu_pct_of_frame = 20.0;
 
     const auto stats = ComputeStats(merged);
     CHECK(stats.gpu_frame_count == 2);
     CHECK(stats.target_gpu_ms_mean == doctest::Approx((5.0 + 8.0) / 2.0));
     CHECK(stats.target_gpu_ms_min == doctest::Approx(5.0));
     CHECK(stats.target_gpu_ms_max == doctest::Approx(8.0));
+    CHECK(stats.target_gpu_pct_mean == doctest::Approx((10.0 + 20.0) / 2.0));
+    CHECK(stats.target_gpu_pct_min == doctest::Approx(10.0));
+    CHECK(stats.target_gpu_pct_max == doctest::Approx(20.0));
 }
 
 TEST_CASE("ComputeStats: gpu aggregates are zero when no row has target_gpu_us") {
@@ -858,6 +872,9 @@ TEST_CASE("ComputeStats: gpu aggregates are zero when no row has target_gpu_us")
     CHECK(stats.target_gpu_ms_mean == 0.0);
     CHECK(stats.target_gpu_ms_min == 0.0);
     CHECK(stats.target_gpu_ms_max == 0.0);
+    CHECK(stats.target_gpu_pct_mean == 0.0);
+    CHECK(stats.target_gpu_pct_min == 0.0);
+    CHECK(stats.target_gpu_pct_max == 0.0);
 }
 
 // ============================================================================
@@ -893,18 +910,18 @@ TEST_CASE("end-to-end: round-trip raw CSVs through merge to merged CSV") {
     const auto stats = ComputeStats(merged);
     CHECK(stats.frame_count == 4);
     // Same values as the python smoke test: target_us 50, 40, 80, 50.
-    CHECK(stats.target_ms_mean == doctest::Approx(0.0550));
-    CHECK(stats.target_ms_min == doctest::Approx(0.0400));
-    CHECK(stats.target_ms_max == doctest::Approx(0.0800));
+    CHECK(stats.target_cpu_ms_mean == doctest::Approx(0.0550));
+    CHECK(stats.target_cpu_ms_min == doctest::Approx(0.0400));
+    CHECK(stats.target_cpu_ms_max == doctest::Approx(0.0800));
 
     std::ostringstream out;
     WriteMergedCsv(out, merged, stats);
     const std::string s = out.str();
     // Sanity-check the same hand-verified header the README documents.
     CHECK(s.find("# frame_count=4\n") != std::string::npos);
-    CHECK(s.find("# target_ms_mean=0.0550\n") != std::string::npos);
+    CHECK(s.find("# target_cpu_ms_mean=0.0550\n") != std::string::npos);
     // No GPU CSVs were read for this case, so target_gpu_us stays blank on
-    // every row and the four GPU header lines all read zero.
+    // every row and the seven GPU header lines all read zero.
     CHECK(s.find("# target_gpu_frame_count=0\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_mean=0.0000\n") != std::string::npos);
 }
@@ -951,12 +968,23 @@ TEST_CASE("end-to-end: with GPU CSVs the join fills target_gpu_us") {
     REQUIRE(merged[1].target_gpu_us.has_value());
     CHECK(*merged[0].target_gpu_us == doctest::Approx(5.0));
     CHECK(*merged[1].target_gpu_us == doctest::Approx(8.0));
+    // GPU pct: frame 0 has a successor (interval = 111'000 ticks / 10 MHz =
+    // 11'100 us), so JoinGpu fills its pct; frame 1 is the last per thread
+    // (no interval) so its pct stays blank even though target_gpu_us is set.
+    REQUIRE(merged[0].target_gpu_pct_of_frame.has_value());
+    CHECK(*merged[0].target_gpu_pct_of_frame ==
+          doctest::Approx(5.0 / 11100.0 * 100.0));
+    CHECK_FALSE(merged[1].target_gpu_pct_of_frame.has_value());
 
     const auto stats = ComputeStats(merged);
     CHECK(stats.gpu_frame_count == 2);
     CHECK(stats.target_gpu_ms_mean == doctest::Approx((0.005 + 0.008) / 2.0));
     CHECK(stats.target_gpu_ms_min == doctest::Approx(0.005));
     CHECK(stats.target_gpu_ms_max == doctest::Approx(0.008));
+    // Only frame 0 has BOTH a GPU sample and an interval -> single-value pct.
+    CHECK(stats.target_gpu_pct_mean == doctest::Approx(5.0 / 11100.0 * 100.0));
+    CHECK(stats.target_gpu_pct_min == doctest::Approx(5.0 / 11100.0 * 100.0));
+    CHECK(stats.target_gpu_pct_max == doctest::Approx(5.0 / 11100.0 * 100.0));
 
     std::ostringstream out;
     WriteMergedCsv(out, merged, stats);
@@ -965,9 +993,11 @@ TEST_CASE("end-to-end: with GPU CSVs the join fills target_gpu_us") {
     CHECK(s.find("# target_gpu_ms_mean=0.0065\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_min=0.0050\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_max=0.0080\n") != std::string::npos);
-    // Each data row carries the .3f-rounded GPU delta as its last cell.
-    CHECK(s.find(",5.000\n") != std::string::npos);
-    CHECK(s.find(",8.000\n") != std::string::npos);
+    // Each data row carries the .3f GPU delta then the .4f GPU pct. Frame 0
+    // has an interval (-> pct = 5/11100*100 = 0.0450); frame 1 is last
+    // (-> blank pct, leaving a trailing comma before the newline).
+    CHECK(s.find(",5.000,0.0450\n") != std::string::npos);
+    CHECK(s.find(",8.000,\n") != std::string::npos);
 }
 
 // ============================================================================

@@ -150,7 +150,7 @@ def test_end_to_end_matches_test_merge_cpp_fixture(tmp_path: Path) -> None:
     """Same input as the end-to-end TEST_CASE in test_merge.cpp.
 
     qpc_freq = 10 MHz means 1 tick = 0.1 us; target_us values are 50, 40, 80,
-    50 for the four frames. target_pct_mean only counts the first three
+    50 for the four frames. target_cpu_pct_mean only counts the first three
     frames (the last has no successor).
     """
     pre_rows = [
@@ -178,20 +178,23 @@ def test_end_to_end_matches_test_merge_cpp_fixture(tmp_path: Path) -> None:
 
     # Header lines exactly as documented in the README.
     assert "# frame_count=4\n" in text
-    assert "# target_ms_mean=0.0550\n" in text
-    assert "# target_ms_min=0.0400\n" in text
-    assert "# target_ms_max=0.0800\n" in text
+    assert "# target_cpu_ms_mean=0.0550\n" in text
+    assert "# target_cpu_ms_min=0.0400\n" in text
+    assert "# target_cpu_ms_max=0.0800\n" in text
     # pct lines carry the '%' suffix.
-    assert "# target_pct_mean=0.5105%\n" in text
-    assert "# target_pct_min=0.3604%\n" in text
-    assert "# target_pct_max=0.7207%\n" in text
+    assert "# target_cpu_pct_mean=0.5105%\n" in text
+    assert "# target_cpu_pct_min=0.3604%\n" in text
+    assert "# target_cpu_pct_max=0.7207%\n" in text
     # No GPU CSVs were written by this test, so the GPU stat block is all
-    # zeros and gpu_frame_count is 0. The 4 lines must still appear so the
+    # zeros and gpu_frame_count is 0. The 7 lines must still appear so the
     # merged-CSV schema stays uniform across D3D11 / non-D3D11 sessions.
     assert "# target_gpu_frame_count=0\n" in text
     assert "# target_gpu_ms_mean=0.0000\n" in text
     assert "# target_gpu_ms_min=0.0000\n" in text
     assert "# target_gpu_ms_max=0.0000\n" in text
+    assert "# target_gpu_pct_mean=0.0000%\n" in text
+    assert "# target_gpu_pct_min=0.0000%\n" in text
+    assert "# target_gpu_pct_max=0.0000%\n" in text
 
     # The matched-frames stdout line is the user-facing confirmation.
     assert "matched frames: 4" in stdout
@@ -261,7 +264,7 @@ def test_last_frame_per_thread_has_blank_interval_and_pct(tmp_path: Path) -> Non
     #   row 1 = thread 1, frame 1  (no successor on thread 1)
     #   row 2 = thread 2, frame 0  (only frame on thread 2)
     # Columns: display_time, thread_id, frame_interval_us, pre_us, post_us,
-    #          target_us, target_pct_of_frame.
+    #          target_us, target_cpu_pct_of_frame.
     rows = [
         line.split(",")
         for line in text.splitlines()
@@ -272,17 +275,17 @@ def test_last_frame_per_thread_has_blank_interval_and_pct(tmp_path: Path) -> Non
     # Row 0 (thread 1, frame 0): has successor -> interval AND pct populated.
     assert rows[0][:2] == ["0", "1"]
     assert rows[0][2] != "", "thread1/frame0 must have a frame_interval_us"
-    assert rows[0][6] != "", "thread1/frame0 must have a target_pct_of_frame"
+    assert rows[0][6] != "", "thread1/frame0 must have a target_cpu_pct_of_frame"
 
     # Row 1 (thread 1, frame 1): no successor on thread 1 -> both blank.
     assert rows[1][:2] == ["1", "1"]
     assert rows[1][2] == "", "thread1/frame1 must have empty frame_interval_us"
-    assert rows[1][6] == "", "thread1/frame1 must have empty target_pct_of_frame"
+    assert rows[1][6] == "", "thread1/frame1 must have empty target_cpu_pct_of_frame"
 
     # Row 2 (thread 2, frame 0): only frame on thread 2 -> both blank.
     assert rows[2][:2] == ["0", "2"]
     assert rows[2][2] == "", "thread2/frame0 must have empty frame_interval_us"
-    assert rows[2][6] == "", "thread2/frame0 must have empty target_pct_of_frame"
+    assert rows[2][6] == "", "thread2/frame0 must have empty target_cpu_pct_of_frame"
 
 
 def test_multiple_threads_sort_by_thread_then_frame(tmp_path: Path) -> None:
@@ -367,9 +370,9 @@ def test_gpu_join_populates_target_gpu_us_when_files_present(tmp_path: Path) -> 
     assert rc == 0
     text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
 
-    # Column header gained the target_gpu_us column.
+    # Column header gained the target_gpu_us + target_gpu_pct_of_frame columns.
     assert "display_time,thread_id,frame_interval_us,pre_us,post_us,target_us," \
-           "target_pct_of_frame,target_gpu_us\n" in text
+           "target_cpu_pct_of_frame,target_gpu_us,target_gpu_pct_of_frame\n" in text
 
     # GPU stats over the two valid samples (5 us + 8 us = 13 us; mean 6.5 us
     # = 0.0065 ms). Both extremes hit gpu_ms_min / gpu_ms_max.
@@ -377,12 +380,20 @@ def test_gpu_join_populates_target_gpu_us_when_files_present(tmp_path: Path) -> 
     assert "# target_gpu_ms_mean=0.0065\n" in text
     assert "# target_gpu_ms_min=0.0050\n" in text
     assert "# target_gpu_ms_max=0.0080\n" in text
+    # GPU pct: only frame 0 has an interval (1000 us), so 5/1000*100 = 0.5000%
+    # is the sole contributing sample -> mean = min = max. Frame 1 is the last
+    # per thread (no interval), so it contributes no GPU pct.
+    assert "# target_gpu_pct_mean=0.5000%\n" in text
+    assert "# target_gpu_pct_min=0.5000%\n" in text
+    assert "# target_gpu_pct_max=0.5000%\n" in text
 
     rows = _data_rows(text)
     assert len(rows) == 2
-    # target_gpu_us is the LAST column (index 7).
+    # target_gpu_us is index 7; target_gpu_pct_of_frame is the new last col (8).
     assert rows[0][7] == "5.000"
     assert rows[1][7] == "8.000"
+    assert rows[0][8] == "0.5000", "frame 0 has an interval -> GPU pct"
+    assert rows[1][8] == "", "frame 1 is last per thread -> blank GPU pct"
 
 
 def test_gpu_absent_emits_zero_stats_and_blank_column(tmp_path: Path) -> None:

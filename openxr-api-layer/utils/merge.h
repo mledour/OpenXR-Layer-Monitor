@@ -94,10 +94,12 @@ namespace openxr_api_layer::merge {
         "display_time,gpu_ticks,gpu_freq,valid";
 
     // One row of the merged CSV. Optionals are blanked out when undefined:
-    //   frame_interval_us / target_pct_of_frame -> last frame per thread (no
-    //       successor) or a non-positive interval.
+    //   frame_interval_us / target_cpu_pct_of_frame -> last frame per thread
+    //       (no successor) or a non-positive interval.
     //   target_gpu_us -> no GPU row on one/both sides for this frame, an
     //       invalid GPU sample, or a GPU clock mismatch (see JoinGpu).
+    //   target_gpu_pct_of_frame -> target_gpu_us is blank, OR this frame has
+    //       no frame_interval (last per thread). GPU duration as % of frame.
     struct MergedRow {
         uint64_t display_time;
         uint32_t thread_id;
@@ -105,34 +107,41 @@ namespace openxr_api_layer::merge {
         double pre_us;
         double post_us;
         double target_us;
-        std::optional<double> target_pct_of_frame;
+        std::optional<double> target_cpu_pct_of_frame;
         std::optional<double> target_gpu_us;
+        std::optional<double> target_gpu_pct_of_frame;
     };
 
     // Session-summary numbers written as # comment lines at the top of the
-    // merged CSV. target_pct_* aggregates ONLY frames that have a
+    // merged CSV. target_cpu_pct_* aggregates ONLY frames that have a
     // frame_interval (i.e. every frame except the last per thread);
-    // target_ms_* aggregates every matched frame. negative_target_count is
+    // target_cpu_ms_* aggregates every matched frame. negative_target_count is
     // surfaced so callers can warn the user when QPC jitter (or a broken
     // chain) pushes some target_us below zero.
     struct MergeStats {
         size_t frame_count;
-        double target_ms_mean;
-        double target_ms_min;
-        double target_ms_max;
-        double target_pct_mean;
-        double target_pct_min;
-        double target_pct_max;
+        double target_cpu_ms_mean;
+        double target_cpu_ms_min;
+        double target_cpu_ms_max;
+        double target_cpu_pct_mean;
+        double target_cpu_pct_min;
+        double target_cpu_pct_max;
         size_t negative_target_count;
         // GPU aggregates over the frames that have a target_gpu_us (i.e. a
         // valid GPU sample on BOTH sides). gpu_frame_count == 0 means no GPU
         // data was captured this session (non-D3D11 host, or GPU timer
-        // creation failed) -- the ms_* fields are then 0.0 and the merged
-        // CSV's target_gpu_us column is blank on every row.
+        // creation failed) -- the ms_*/pct_* fields are then 0.0 and the
+        // merged CSV's target_gpu_us column is blank on every row.
+        // target_gpu_pct_* aggregates the subset that ALSO has a
+        // frame_interval (same exclusion as the CPU pct: last frame per
+        // thread has none).
         size_t gpu_frame_count;
         double target_gpu_ms_mean;
         double target_gpu_ms_min;
         double target_gpu_ms_max;
+        double target_gpu_pct_mean;
+        double target_gpu_pct_min;
+        double target_gpu_pct_max;
     };
 
     // Returns rows = {} and qpc_freq = defaultFreq if the file is missing,
@@ -152,7 +161,7 @@ namespace openxr_api_layer::merge {
 
     // Joins preRows + postRows by (display_time, thread_id), computes
     // target_us = pre_bracket - post_bracket, derives frame_interval_us
-    // from pre.qpc_entry deltas (per thread), and sets target_pct_of_frame
+    // from pre.qpc_entry deltas (per thread), and sets target_cpu_pct_of_frame
     // accordingly. Result is sorted by (thread_id, display_time) for
     // deterministic CSV output. Rows missing from either side are dropped.
     //
@@ -170,7 +179,7 @@ namespace openxr_api_layer::merge {
     //
     // Rows where the next-per-thread interval would be <= 0 (TSC went
     // backwards across a core migration on non-invariant hardware) get
-    // frame_interval_us / target_pct_of_frame left blank, matching the
+    // frame_interval_us / target_cpu_pct_of_frame left blank, matching the
     // last-frame-per-thread case.
     std::vector<MergedRow> ComputeMerge(
         const std::vector<RawFrameRow>& preRows, int64_t preFreq,
