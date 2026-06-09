@@ -101,6 +101,21 @@
 //     merge's post_ticks >= pre_ticks + frequency-match guards catch the
 //     common cases, but a coincidental match-after-corruption would not
 //     be detected. Re-run if a session crosses a TDR / driver restart.
+//   * D3D12 SANDWICH OVERHEAD FLOOR (measured 2026-06, NOT a bug): pre and
+//     post each submit their single timestamp in a SEPARATE Execute
+//     CommandLists, so the GPU idles between the two submissions and inflates
+//     (T_post - T_pre) by ~290 us whenever the target's GPU work is light.
+//     The overhead is NOT additive: a heavy target fills that idle, so a
+//     swept synthetic load measured the inflation falling from ~290 us at
+//     <=300 us of real target work to ~74 us at ~3.4 ms. It therefore CANNOT
+//     be removed by subtracting a constant baseline. D3D11 has no such floor
+//     -- both timestamps are inline in the app's single immediate-context
+//     stream (zero inter-submission gap). Net effect: D3D12 target_gpu_us is
+//     trustworthy for targets with substantial per-frame GPU cost (>~1 ms,
+//     small relative error) and dominated by the floor for light ones
+//     (<~300 us). To profile a layer you OWN, prefer timing it INLINE in its
+//     own command stream (the clean method OpenXR-Toolkit / XrTelemetry use
+//     for their own work). Full data + reasoning in the README.
 // =============================================================================
 
 #include <array>

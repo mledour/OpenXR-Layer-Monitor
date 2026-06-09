@@ -54,6 +54,49 @@ Both **D3D11** and **D3D12** are wired up:
 Vulkan / OpenGL hosts get a blank GPU column; the CPU sandwich keeps
 working.
 
+### D3D12 `target_gpu_us`: a measured overhead floor (read before trusting it)
+
+The CPU sandwich cancels cleanly on both APIs. The **GPU sandwich does not,
+on D3D12** — and this is architectural, not a bug we can patch away.
+
+- **D3D11** puts both timestamps inline in the app's *single immediate-context
+  stream*, so `T_pre`, the target's draws, and `T_post` are adjacent in one
+  ordered command stream → `T_post − T_pre` ≈ the target's GPU work, floor ≈ 0.
+- **D3D12** has no shared stream: pre and post each `ExecuteCommandLists` their
+  timestamp *separately*, and the GPU **idles between the two submissions**
+  when the target's work is light. That idle inflates `target_gpu_us`.
+
+A swept synthetic load (a layer doing a known amount `K` of GPU work between
+pre and post) measured the overhead `O = target_gpu_us − K`:
+
+| target GPU work `K` | sandwich `target_gpu_us` | overhead `O` |
+|---|---|---|
+| 0 µs   | 289 µs  | **289 µs** |
+| 60 µs  | 347 µs  | **287 µs** |
+| 281 µs | 572 µs  | **291 µs** |
+| 1066 µs| 1353 µs | **287 µs** (bimodal) |
+| 3433 µs| 3507 µs | **74 µs** |
+
+So `O` is a near-constant ~290 µs while the target's GPU work is small, then
+**gets absorbed** as the work grows (the GPU stops idling). Because it is *not
+additive*, it **cannot be removed by subtracting a constant baseline** — doing
+so would over-correct heavy targets.
+
+**What this means in practice:**
+
+- ✅ **Heavy targets (> ~1 ms per-frame GPU):** `target_gpu_us` is reliable
+  (the ~74–290 µs bias is small in relative terms).
+- ⚠️ **Light targets (< ~300 µs per-frame GPU):** the ~290 µs floor dominates;
+  treat `target_gpu_us` as an upper bound, not an absolute figure.
+- ✅ **CPU (`target_us`) is unaffected** on either API.
+
+**To profile a layer you own**, prefer timing its GPU work **inline in the
+layer's own command stream** (one `EndQuery`…work…`EndQuery` pair in the same
+command list / immediate context) — the clean, floor-free method that
+OpenXR-Toolkit and XrTelemetry use for their own work. The zero-touch GPU
+sandwich above is the fallback for profiling a *third-party* target you can't
+modify, with the caveat in mind.
+
 ## What you can do with it
 
 - Compare two versions of the same layer after an optimization
