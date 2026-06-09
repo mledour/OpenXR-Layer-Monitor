@@ -819,16 +819,28 @@ namespace openxr_api_layer {
         // Write the accumulated K rows to gpuload-<pid>.csv (binary so the '\n'
         // survives MSVC text-mode translation), mirroring the GPU CSV header
         // style. Touches no D3D object, so it is safe even after the session's
-        // device is gone (the destructor fallback). No-op when the harness is
-        // off or recorded nothing.
+        // device is gone. Called at Ctrl+F9-OFF (the primary path, alongside
+        // the frame/GPU CSV finalize + merge) and again at xrDestroySession /
+        // dtor as a fallback. Idempotent: re-flushing the same rows just
+        // rewrites the file. Logs the outcome (only ever called off the
+        // per-frame hot path, so Log() is allowed here).
         void FlushSyntheticLoadCsv() {
-            if (!g_synthLoad || g_synthRows.empty() || localAppData.empty()) {
+            if (!g_synthLoad || localAppData.empty()) {
+                return;
+            }
+            if (g_synthRows.empty()) {
+                Log("Synthetic load: nothing to flush (0 K rows resolved this "
+                    "session -- if the harness was active, this points to a "
+                    "PollResolved/submission problem, not a flush-timing one)\n");
                 return;
             }
             const auto pid = GetCurrentProcessId();
             const auto path = localAppData / fmt::format("gpuload-{}.csv", pid);
             std::ofstream s(path, std::ios::binary | std::ios::trunc);
             if (!s) {
+                ErrorLog(fmt::format(
+                    "Synthetic load: could not open {} for writing\n",
+                    path.string()));
                 return;
             }
             s << "# gpu_clock=d3d12\n"
@@ -839,6 +851,9 @@ namespace openxr_api_layer {
                 s << r.display_time << ',' << r.known_ticks << ','
                   << r.gpu_freq << ',' << r.valid << '\n';
             }
+            Log(fmt::format(
+                "Synthetic load: wrote {} K rows to gpuload-{}.csv\n",
+                g_synthRows.size(), pid));
         }
 
         // Writer-thread accessors. Const char* return is safe because every
@@ -1231,12 +1246,31 @@ namespace openxr_api_layer {
                 if (g_gpuTimer) {
                     g_gpuTimer->Reset();
                 }
+                // TEMPORARY additivity harness: reset the K accumulator for the
+                // new monitoring period, matching g_csv's truncate-on-Start so
+                // the gpuload CSV covers only this Ctrl+F9 on->off window.
+                if constexpr (kIsPreSide) {
+                    g_synthRows.clear();
+                }
             } else {
                 g_csv.Stop();     // noexcept; catches its own join exceptions
                 // Recover any GPU timestamps the timer resolved but the
                 // per-frame drain never picked up, before closing the sink.
                 DrainResolvedGpuOnce();
                 g_gpuCsv.Stop();  // noexcept; flush the GPU CSV before merge
+                // TEMPORARY additivity harness: flush gpuload-<pid>.csv HERE,
+                // at the same Ctrl+F9-OFF point the frame/GPU CSVs are finalized
+                // and the merge runs. Tying the flush ONLY to xrDestroySession
+                // lost the file whenever the app was killed after stopping
+                // monitoring -- the frame CSVs survive because they're written
+                // live by the writer thread and merged here, so the K CSV must
+                // be finalized at the same instant.
+                if constexpr (kIsPreSide) {
+                    if (g_synthLoad) {
+                        g_synthLoad->PollResolved(g_synthRows);
+                        FlushSyntheticLoadCsv();
+                    }
+                }
                 if constexpr (kIsPostSide) {
                     // Post is downstream, so by the time we reach this
                     // line pre's ApplyToggle has already returned -- which
