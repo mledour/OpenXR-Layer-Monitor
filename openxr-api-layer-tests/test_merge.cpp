@@ -572,7 +572,7 @@ TEST_CASE("WriteMergedCsv: header has the fourteen # lines + column line") {
     // GPU block: no rows have target_gpu_us, so the count is 0 and the
     // ms_*/pct_* aggregates round to 0.0000. The ms lines carry no '%'
     // suffix; the pct lines do.
-    CHECK(s.find("# target_gpu_frame_count=0\n") != std::string::npos);
+    CHECK(s.find("# gpu_frame_count=0\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_mean=0.0000\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_min=0.0000\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_max=0.0000\n") != std::string::npos);
@@ -922,7 +922,7 @@ TEST_CASE("end-to-end: round-trip raw CSVs through merge to merged CSV") {
     CHECK(s.find("# target_cpu_ms_mean=0.0550\n") != std::string::npos);
     // No GPU CSVs were read for this case, so target_gpu_us stays blank on
     // every row and the seven GPU header lines all read zero.
-    CHECK(s.find("# target_gpu_frame_count=0\n") != std::string::npos);
+    CHECK(s.find("# gpu_frame_count=0\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_mean=0.0000\n") != std::string::npos);
 }
 
@@ -989,7 +989,7 @@ TEST_CASE("end-to-end: with GPU CSVs the join fills target_gpu_us") {
     std::ostringstream out;
     WriteMergedCsv(out, merged, stats);
     const std::string s = out.str();
-    CHECK(s.find("# target_gpu_frame_count=2\n") != std::string::npos);
+    CHECK(s.find("# gpu_frame_count=2\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_mean=0.0065\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_min=0.0050\n") != std::string::npos);
     CHECK(s.find("# target_gpu_ms_max=0.0080\n") != std::string::npos);

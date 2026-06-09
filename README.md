@@ -269,7 +269,7 @@ or remove the two HKLM values manually.
    # target_cpu_pct_mean=0.1110%
    # target_cpu_pct_min=0.0030%
    # target_cpu_pct_max=3.0780%
-   # target_gpu_frame_count=1839
+   # gpu_frame_count=1839
    # target_gpu_ms_mean=0.0840
    # target_gpu_ms_min=0.0210
    # target_gpu_ms_max=2.1500
@@ -286,9 +286,9 @@ or remove the two HKLM values manually.
    the actual per-call cost. The `*_pct_*` lines aggregate only over frames
    that have a successor (every frame except the last per thread).
 
-   The seven `target_gpu_*` lines aggregate the GPU sandwich (the count,
-   three `ms_*` and three `pct_*`). The `frame_count` for the GPU block is
-   independent of the CPU one: it only counts frames whose timestamp
+   The seven GPU lines aggregate the GPU sandwich: `gpu_frame_count` plus
+   three `target_gpu_ms_*` and three `target_gpu_pct_*`. `gpu_frame_count`
+   is independent of `frame_count`: it only counts frames whose timestamp
    resolved successfully on BOTH sides (no disjoint clock, matching
    frequency, monotonic delta); the `pct_*` subset also needs an interval.
    On a non-D3D11 host the lines are still present with zero counts and
@@ -498,7 +498,7 @@ column header, then one row per matched frame:
 # target_cpu_pct_mean=<float>%       percentage of frame interval
 # target_cpu_pct_min=<float>%        percentage of frame interval
 # target_cpu_pct_max=<float>%        percentage of frame interval
-# target_gpu_frame_count=<int>       frames with a valid GPU sample on both sides
+# gpu_frame_count=<int>              frames with a valid GPU sample on both sides
 # target_gpu_ms_mean=<float>         ms (over the gpu_frame_count subset only)
 # target_gpu_ms_min=<float>          ms
 # target_gpu_ms_max=<float>          ms

@@ -188,7 +188,7 @@ def test_end_to_end_matches_test_merge_cpp_fixture(tmp_path: Path) -> None:
     # No GPU CSVs were written by this test, so the GPU stat block is all
     # zeros and gpu_frame_count is 0. The 7 lines must still appear so the
     # merged-CSV schema stays uniform across D3D11 / non-D3D11 sessions.
-    assert "# target_gpu_frame_count=0\n" in text
+    assert "# gpu_frame_count=0\n" in text
     assert "# target_gpu_ms_mean=0.0000\n" in text
     assert "# target_gpu_ms_min=0.0000\n" in text
     assert "# target_gpu_ms_max=0.0000\n" in text
@@ -376,7 +376,7 @@ def test_gpu_join_populates_target_gpu_us_when_files_present(tmp_path: Path) -> 
 
     # GPU stats over the two valid samples (5 us + 8 us = 13 us; mean 6.5 us
     # = 0.0065 ms). Both extremes hit gpu_ms_min / gpu_ms_max.
-    assert "# target_gpu_frame_count=2\n" in text
+    assert "# gpu_frame_count=2\n" in text
     assert "# target_gpu_ms_mean=0.0065\n" in text
     assert "# target_gpu_ms_min=0.0050\n" in text
     assert "# target_gpu_ms_max=0.0080\n" in text
@@ -410,7 +410,7 @@ def test_gpu_absent_emits_zero_stats_and_blank_column(tmp_path: Path) -> None:
     assert rc == 0
     text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
 
-    assert "# target_gpu_frame_count=0\n" in text
+    assert "# gpu_frame_count=0\n" in text
     assert "# target_gpu_ms_mean=0.0000\n" in text
     assert "# target_gpu_ms_min=0.0000\n" in text
     assert "# target_gpu_ms_max=0.0000\n" in text
@@ -446,7 +446,7 @@ def test_gpu_invalid_row_blanks_target_gpu_us(tmp_path: Path) -> None:
     assert rows[0][7] == "5.000"
     assert rows[1][7] == ""
     # Only one valid GPU sample feeds the aggregates.
-    assert "# target_gpu_frame_count=1\n" in text
+    assert "# gpu_frame_count=1\n" in text
 
 
 def test_gpu_freq_mismatch_blanks_target_gpu_us(tmp_path: Path) -> None:
@@ -469,7 +469,7 @@ def test_gpu_freq_mismatch_blanks_target_gpu_us(tmp_path: Path) -> None:
     text = (tmp_path / f"frames-merged-{pid}.csv").read_text(encoding="utf-8")
     rows = _data_rows(text)
     assert rows[0][7] == ""
-    assert "# target_gpu_frame_count=0\n" in text
+    assert "# gpu_frame_count=0\n" in text
 
 
 def test_gpu_backwards_counter_blanks_target_gpu_us(tmp_path: Path) -> None:
@@ -525,7 +525,7 @@ def test_gpu_malformed_header_warns_and_continues_cpu_only(tmp_path: Path) -> No
     # on its thread (no successor -> no interval).
     assert rows[0][:6] == ["0", "1", "", "1000.000", "500.000", "500.000"]
     assert rows[0][7] == ""
-    assert "# target_gpu_frame_count=0\n" in text
+    assert "# gpu_frame_count=0\n" in text
 
 
 def test_gpu_only_one_side_present_blanks_target_gpu_us(tmp_path: Path) -> None:
@@ -551,7 +551,7 @@ def test_gpu_only_one_side_present_blanks_target_gpu_us(tmp_path: Path) -> None:
     rows = _data_rows(text)
     assert rows[0][7] == ""
     assert rows[1][7] == ""
-    assert "# target_gpu_frame_count=0\n" in text
+    assert "# gpu_frame_count=0\n" in text
 
 
 def test_gpu_lf_only_line_endings(tmp_path: Path) -> None:

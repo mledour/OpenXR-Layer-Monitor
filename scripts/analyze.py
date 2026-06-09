@@ -452,7 +452,7 @@ def main() -> int:
         fh.write(f"# target_cpu_pct_mean={target_cpu_pct_mean:.4f}%\n")
         fh.write(f"# target_cpu_pct_min={target_cpu_pct_min:.4f}%\n")
         fh.write(f"# target_cpu_pct_max={target_cpu_pct_max:.4f}%\n")
-        fh.write(f"# target_gpu_frame_count={len(gpu_values)}\n")
+        fh.write(f"# gpu_frame_count={len(gpu_values)}\n")
         fh.write(f"# target_gpu_ms_mean={target_gpu_ms_mean:.4f}\n")
         fh.write(f"# target_gpu_ms_min={target_gpu_ms_min:.4f}\n")
         fh.write(f"# target_gpu_ms_max={target_gpu_ms_max:.4f}\n")

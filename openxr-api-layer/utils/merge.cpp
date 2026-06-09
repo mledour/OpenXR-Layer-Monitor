@@ -401,7 +401,7 @@ namespace openxr_api_layer::merge {
             << "# target_cpu_pct_mean=" << fmt::format("{:.4f}", stats.target_cpu_pct_mean) << "%\n"
             << "# target_cpu_pct_min="  << fmt::format("{:.4f}", stats.target_cpu_pct_min)  << "%\n"
             << "# target_cpu_pct_max="  << fmt::format("{:.4f}", stats.target_cpu_pct_max)  << "%\n"
-            << "# target_gpu_frame_count=" << stats.gpu_frame_count << '\n'
+            << "# gpu_frame_count=" << stats.gpu_frame_count << '\n'
             << "# target_gpu_ms_mean=" << fmt::format("{:.4f}", stats.target_gpu_ms_mean) << '\n'
             << "# target_gpu_ms_min="  << fmt::format("{:.4f}", stats.target_gpu_ms_min)  << '\n'
             << "# target_gpu_ms_max="  << fmt::format("{:.4f}", stats.target_gpu_ms_max)  << '\n'
