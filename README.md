@@ -371,7 +371,7 @@ or remove the two HKLM values manually.
        max     2150.00
 
    target_gpu_pct     (% of frame interval):
-       count  1839
+       count  1838
        mean      0.756
        median    0.659
        p95       1.787
@@ -486,8 +486,8 @@ also not recorded (the writer is already shut down by the time the
 record path would have appended), so the CSV row count is the number
 of frames strictly between start and stop.
 
-The merged CSV has a different schema -- eleven `#` comment lines at
-the top with the session summary (seven CPU + four GPU), then the
+The merged CSV has a different schema -- fourteen `#` comment lines at
+the top with the session summary (seven CPU + seven GPU), then the
 column header, then one row per matched frame:
 
 ```

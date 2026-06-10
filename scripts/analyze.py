@@ -113,7 +113,7 @@ def load(path: Path) -> Frames:
                 continue
             if not header_found:
                 # The raw per-side CSV has exactly four columns. A user
-                # passing the merged CSV by mistake (seven columns,
+                # passing the merged CSV by mistake (nine columns,
                 # starts with display_time,thread_id,frame_interval_us...)
                 # would otherwise crash with an obscure ValueError on
                 # int("11100.000"). Catch it here with a clear message.

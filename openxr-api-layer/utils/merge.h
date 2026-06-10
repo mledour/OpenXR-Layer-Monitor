@@ -85,7 +85,7 @@ namespace openxr_api_layer::merge {
     };
 
     // Expected raw per-side CSV column header, exactly. Any deviation
-    // (including the 8-column merged-CSV header) is rejected.
+    // (including the 9-column merged-CSV header) is rejected.
     inline constexpr const char* kExpectedColumnHeader =
         "display_time,thread_id,qpc_entry,qpc_exit";
 
@@ -212,10 +212,11 @@ namespace openxr_api_layer::merge {
     // JoinGpu so the GPU stats reflect the joined values.
     MergeStats ComputeStats(const std::vector<MergedRow>& merged);
 
-    // Writes the merged CSV with eleven `#`-comment header lines (seven CPU
-    // stats + four GPU stats), then the column header, then one row per
-    // MergedRow. The trailing column is target_gpu_us (blank when the row
-    // has no GPU sample). Output is LF-only regardless of platform; the
+    // Writes the merged CSV with fourteen `#`-comment header lines (seven CPU
+    // stats + seven GPU stats: gpu_frame_count + three ms_* + three pct_*),
+    // then the column header, then one row per MergedRow. The trailing column
+    // is target_gpu_pct_of_frame (blank when the row has no GPU sample or no
+    // frame interval). Output is LF-only regardless of platform; the
     // caller is responsible for opening `out` in a mode that does not
     // translate line endings (binary mode on Windows).
     void WriteMergedCsv(std::ostream& out,

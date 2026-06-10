@@ -233,7 +233,7 @@ TEST_CASE("ReadFrameCsv: empty lines and stray comments are ignored") {
 TEST_CASE("ReadFrameCsv: header_valid is false when the column header does not "
           "match the spec (e.g. merged CSV fed in by mistake)") {
     // Simulate a frames-merged-<pid>.csv fed in where the per-side CSV
-    // belongs. Its first non-comment line lists eight columns (since GPU
+    // belongs. Its first non-comment line lists nine columns (since GPU
     // monitoring was added), not the four ReadFrameCsv expects.
     const fs::path path = TestTempDir() / "rfc_merged_by_mistake.csv";
     {

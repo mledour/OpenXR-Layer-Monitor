@@ -397,7 +397,7 @@ def test_gpu_join_populates_target_gpu_us_when_files_present(tmp_path: Path) -> 
 
 
 def test_gpu_absent_emits_zero_stats_and_blank_column(tmp_path: Path) -> None:
-    """No GPU CSVs at all (non-D3D11 host). The 4 GPU header lines must
+    """No GPU CSVs at all (non-D3D11 host). The 7 GPU header lines must
     still appear so the schema is uniform, but they all read zero and every
     target_gpu_us cell is blank."""
     pid = "9002"
