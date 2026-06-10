@@ -258,40 +258,45 @@ or remove the two HKLM values manually.
    %LOCALAPPDATA%\XR_APILAYER_MLEDOUR_layer_monitor\frames-merged-<pid>.csv
    ```
 
-   The top **eleven** lines are a session-wide summary (also greppable
+   The top **fourteen** lines are a session-wide summary (also greppable
    from the shell):
 
    ```
    # frame_count=1842
-   # target_ms_mean=0.0123
-   # target_ms_min=0.0001
-   # target_ms_max=0.3417
-   # target_pct_mean=0.1110%
-   # target_pct_min=0.0030%
-   # target_pct_max=3.0780%
-   # target_gpu_frame_count=1839
+   # target_cpu_ms_mean=0.0123
+   # target_cpu_ms_min=0.0001
+   # target_cpu_ms_max=0.3417
+   # target_cpu_pct_mean=0.1110%
+   # target_cpu_pct_min=0.0030%
+   # target_cpu_pct_max=3.0780%
+   # gpu_frame_count=1839
    # target_gpu_ms_mean=0.0840
    # target_gpu_ms_min=0.0210
    # target_gpu_ms_max=2.1500
+   # target_gpu_pct_mean=0.7560%
+   # target_gpu_pct_min=0.1890%
+   # target_gpu_pct_max=19.3500%
    ```
 
    `frame_count` is the number of matched frames between pre and post.
-   `target_ms_*` is the CPU cost the target layer added per frame, in
-   milliseconds. `target_pct_*` is that cost expressed as a percentage
+   `target_cpu_ms_*` is the CPU cost the target layer added per frame, in
+   milliseconds. `target_cpu_pct_*` is that cost expressed as a percentage
    of the host's frame interval. The min / max bound the variability:
    useful for spotting bursty or sparse layers where the mean dilutes
-   the actual per-call cost. `target_pct_*` aggregates only over frames
+   the actual per-call cost. The `*_pct_*` lines aggregate only over frames
    that have a successor (every frame except the last per thread).
 
-   The four `target_gpu_*` lines aggregate the GPU sandwich. The
-   `frame_count` for the GPU block is independent of the CPU one: it
-   only counts frames whose D3D11 timestamp resolved successfully on
-   BOTH sides (no disjoint clock, matching frequency, monotonic delta).
-   On a non-D3D11 host the four lines are still present with zero
-   counts and zero ms -- the schema stays uniform so a single parser
-   handles every session.
+   The seven GPU lines aggregate the GPU sandwich: `gpu_frame_count` plus
+   three `target_gpu_ms_*` and three `target_gpu_pct_*`. `gpu_frame_count`
+   is independent of `frame_count`: it only counts frames whose timestamp
+   resolved successfully on BOTH sides (no disjoint clock, matching
+   frequency, monotonic delta); the `pct_*` subset also needs an interval.
+   On a non-D3D11 host the lines are still present with zero counts and
+   zeros -- the schema stays uniform so a single parser handles every
+   session. (See the D3D12 floor caveat above before trusting GPU numbers
+   for a light target.)
 
-   **`target_ms_min` can be negative.** `target_us = pre_us - post_us`
+   **`target_cpu_ms_min` can be negative.** `target_us = pre_us - post_us`
    and QPC jitter occasionally pushes the post-side bracket slightly
    above the pre-side one, especially for layers whose own cost is
    below the QPC noise floor (~hundreds of nanoseconds). The data is
@@ -311,14 +316,16 @@ or remove the two HKLM values manually.
    | `pre_us`                | pre-side bracket = target + post + runtime |
    | `post_us`               | post-side bracket = runtime |
    | `target_us`             | `pre_us − post_us` -- the target layer's CPU cost |
-   | `target_pct_of_frame`   | `target_us / frame_interval_us * 100` (blank on the last row) |
+   | `target_cpu_pct_of_frame` | `target_us / frame_interval_us * 100` (blank on the last row) |
    | `target_gpu_us`         | `(post_gpu_ticks − pre_gpu_ticks) / gpu_freq * 1e6` (blank when no valid GPU sample on both sides, non-D3D11 host, frequency mismatch, or backwards counter) |
+   | `target_gpu_pct_of_frame` | `target_gpu_us / frame_interval_us * 100` (blank when `target_gpu_us` is blank, or on the last row) |
 
    Drop it into a spreadsheet / pandas / your plotting tool of choice.
-   The `target_pct_of_frame` column answers "what slice of the host's
-   frame budget did this layer eat" directly; useful for triaging
-   spikes (filter `target_pct_of_frame > 1.0` to find frames where the
-   layer ate more than 1 % of the budget).
+   The `target_cpu_pct_of_frame` column answers "what slice of the host's
+   frame budget did this layer's CPU work eat" directly; useful for triaging
+   spikes (filter `target_cpu_pct_of_frame > 1.0` to find frames where the
+   layer ate more than 1 % of the budget). `target_gpu_pct_of_frame` does the
+   same for its GPU work.
 
 7. **For stats at the command line**, run `scripts\analyze.py` against
    the per-side CSVs (the script and the in-DLL merge produce the same
@@ -336,7 +343,7 @@ or remove the two HKLM values manually.
    ```
    matched frames: 1842
 
-   target_us          (microseconds):
+   target_cpu_us      (microseconds, CPU):
        count  1842
        mean      12.34
        median     8.10
@@ -345,7 +352,7 @@ or remove the two HKLM values manually.
        min        0.30
        max      341.70
 
-   target_pct_of_frame (% of frame interval):
+   target_cpu_pct     (% of frame interval):
        count  1841
        mean      0.111
        median    0.073
@@ -354,7 +361,7 @@ or remove the two HKLM values manually.
        min       0.003
        max       3.078
 
-   target_gpu_us      (microseconds):
+   target_gpu_us      (microseconds, GPU):
        count  1839
        mean      84.00
        median    73.20
@@ -362,6 +369,15 @@ or remove the two HKLM values manually.
        p99      512.30
        min       21.00
        max     2150.00
+
+   target_gpu_pct     (% of frame interval):
+       count  1838
+       mean      0.756
+       median    0.659
+       p95       1.787
+       p99       4.616
+       min       0.189
+       max      19.350
 
    frame_interval_us median: 11100.00  (~90.1 Hz)
    wrote frames-merged.csv
@@ -470,34 +486,37 @@ also not recorded (the writer is already shut down by the time the
 record path would have appended), so the CSV row count is the number
 of frames strictly between start and stop.
 
-The merged CSV has a different schema -- eleven `#` comment lines at
-the top with the session summary (seven CPU + four GPU), then the
+The merged CSV has a different schema -- fourteen `#` comment lines at
+the top with the session summary (seven CPU + seven GPU), then the
 column header, then one row per matched frame:
 
 ```
 # frame_count=<int>
-# target_ms_mean=<float>             ms
-# target_ms_min=<float>              ms (may be negative -- see below)
-# target_ms_max=<float>              ms
-# target_pct_mean=<float>%           percentage of frame interval
-# target_pct_min=<float>%            percentage of frame interval
-# target_pct_max=<float>%            percentage of frame interval
-# target_gpu_frame_count=<int>       frames with a valid GPU sample on both sides
+# target_cpu_ms_mean=<float>         ms
+# target_cpu_ms_min=<float>          ms (may be negative -- see below)
+# target_cpu_ms_max=<float>          ms
+# target_cpu_pct_mean=<float>%       percentage of frame interval
+# target_cpu_pct_min=<float>%        percentage of frame interval
+# target_cpu_pct_max=<float>%        percentage of frame interval
+# gpu_frame_count=<int>              frames with a valid GPU sample on both sides
 # target_gpu_ms_mean=<float>         ms (over the gpu_frame_count subset only)
 # target_gpu_ms_min=<float>          ms
 # target_gpu_ms_max=<float>          ms
-display_time,thread_id,frame_interval_us,pre_us,post_us,target_us,target_pct_of_frame,target_gpu_us
-<int>,<int>,<float>,<float>,<float>,<float>,<float>,<float>
+# target_gpu_pct_mean=<float>%       percentage of frame interval
+# target_gpu_pct_min=<float>%        percentage of frame interval
+# target_gpu_pct_max=<float>%        percentage of frame interval
+display_time,thread_id,frame_interval_us,pre_us,post_us,target_us,target_cpu_pct_of_frame,target_gpu_us,target_gpu_pct_of_frame
+<int>,<int>,<float>,<float>,<float>,<float>,<float>,<float>,<float>
 ...
 ```
 
-All `#`-prefixed values are bare numbers (no unit) except
-`target_pct_*` which carries a literal `%` after the value for
-visual clarity. The four GPU stat lines are zero (and the
-`target_gpu_us` column is blank on every row) when neither a D3D11
-nor a D3D12 graphics binding was found in `xrCreateSession` (Vulkan /
-OpenGL hosts) -- the schema stays the same so a single parser handles
-every session. All line endings are LF (the C++ writer opens the file
+All `#`-prefixed values are bare numbers (no unit) except the
+`*_pct_*` lines which carry a literal `%` after the value for
+visual clarity. The seven GPU stat lines are zero (and the
+`target_gpu_us` / `target_gpu_pct_of_frame` columns are blank on every
+row) when neither a D3D11 nor a D3D12 graphics binding was found in
+`xrCreateSession` (Vulkan / OpenGL hosts) -- the schema stays the same
+so a single parser handles every session. All line endings are LF (the C++ writer opens the file
 in binary mode, the Python writer uses `lineterminator='\n'`).
 
 ## How it works

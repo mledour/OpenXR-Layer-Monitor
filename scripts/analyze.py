@@ -18,18 +18,20 @@ Math:
     post_us           = (post_exit - post_entry) / qpc_freq * 1e6
     target_us         = pre_us - post_us
     frame_interval_us = pre_entry[i+1] - pre_entry[i]      (per thread)
-    target_pct_of_frame = target_us / frame_interval_us * 100
+    target_cpu_pct_of_frame = target_us / frame_interval_us * 100
     target_gpu_us     = (gpu_post_ticks - gpu_pre_ticks) / gpu_freq * 1e6
                         (joined by display_time; blank unless both GPU rows are
                          valid, share a frequency, and post_ticks >= pre_ticks)
+    target_gpu_pct_of_frame = target_gpu_us / frame_interval_us * 100
 
 Output columns (one row per matched frame, sorted by thread then display_time):
     display_time,thread_id,frame_interval_us,pre_us,post_us,target_us,
-    target_pct_of_frame,target_gpu_us
+    target_cpu_pct_of_frame,target_gpu_us,target_gpu_pct_of_frame
 
-The last frame per thread has no successor, so frame_interval_us and
-target_pct_of_frame are left blank for that row. target_gpu_us is blank for
-any frame without a valid GPU sample on both sides.
+The last frame per thread has no successor, so frame_interval_us,
+target_cpu_pct_of_frame and target_gpu_pct_of_frame are left blank for that
+row. target_gpu_us is blank for any frame without a valid GPU sample on both
+sides.
 
 Rows are paired by (display_time, thread_id). Mismatched counts are reported
 as warnings and the script joins on the common subset.
@@ -111,7 +113,7 @@ def load(path: Path) -> Frames:
                 continue
             if not header_found:
                 # The raw per-side CSV has exactly four columns. A user
-                # passing the merged CSV by mistake (seven columns,
+                # passing the merged CSV by mistake (nine columns,
                 # starts with display_time,thread_id,frame_interval_us...)
                 # would otherwise crash with an obscure ValueError on
                 # int("11100.000"). Catch it here with a clear message.
@@ -337,7 +339,8 @@ def main() -> int:
     post_index = {(r[0], r[1]): r for r in post.rows}
     pre_only = 0
     merged: list[
-        tuple[int, int, float | None, float, float, float, float | None, float | None]
+        tuple[int, int, float | None, float, float, float, float | None,
+              float | None, float | None]
     ] = []
     for fi, tid, pe, px in pre.rows:
         prow = post_index.pop((fi, tid), None)
@@ -367,9 +370,15 @@ def main() -> int:
         # GPU join by display_time -- blank when no valid GPU sample on both
         # sides. Matches the C++ JoinGpu guards.
         target_gpu = gpu_target_us(fi, gpu_pre_idx, gpu_post_idx)
+        # GPU duration as % of the frame interval, mirroring target_pct (CPU).
+        # Only when this frame has a GPU sample AND an interval. Matches the
+        # C++ JoinGpu pct computation.
+        target_gpu_pct = None
+        if target_gpu is not None and frame_interval_us is not None:
+            target_gpu_pct = target_gpu / frame_interval_us * 100.0
 
         merged.append((fi, tid, frame_interval_us, pre_us, post_us, target_us,
-                       target_pct, target_gpu))
+                       target_pct, target_gpu, target_gpu_pct))
 
     post_only = len(post_index)
     if pre_only or post_only:
@@ -387,14 +396,17 @@ def main() -> int:
     interval_values = [r[2] for r in merged if r[2] is not None]
     pct_values = [r[6] for r in merged if r[6] is not None]
     gpu_values = [r[7] for r in merged if r[7] is not None]
+    gpu_pct_values = [r[8] for r in merged if r[8] is not None]
 
     print(f"matched frames: {len(merged)}")
     print()
-    print_stats("target_us         ", target_values, "(microseconds)")
+    print_stats("target_cpu_us      ", target_values, "(microseconds, CPU)")
     print()
-    print_stats("target_pct_of_frame", pct_values, "(% of frame interval)", fmt="8.3f")
+    print_stats("target_cpu_pct     ", pct_values, "(% of frame interval)", fmt="8.3f")
     print()
-    print_stats("target_gpu_us     ", gpu_values, "(microseconds)")
+    print_stats("target_gpu_us      ", gpu_values, "(microseconds, GPU)")
+    print()
+    print_stats("target_gpu_pct     ", gpu_pct_values, "(% of frame interval)", fmt="8.3f")
     print()
     if interval_values:
         fps_median = 1e6 / percentile(sorted(interval_values), 50)
@@ -412,15 +424,20 @@ def main() -> int:
     # numbers regardless of which path produced the file. pct_* excludes
     # the last frame per thread (no successor -> no interval -> no pct),
     # matching the C++ merge.
-    target_ms_values = [v / 1000.0 for v in target_values]
-    target_ms_mean, target_ms_min, target_ms_max = _summarize(target_ms_values)
-    target_pct_mean, target_pct_min, target_pct_max = _summarize(pct_values)
+    target_cpu_ms_values = [v / 1000.0 for v in target_values]
+    target_cpu_ms_mean, target_cpu_ms_min, target_cpu_ms_max = _summarize(
+        target_cpu_ms_values)
+    target_cpu_pct_mean, target_cpu_pct_min, target_cpu_pct_max = _summarize(
+        pct_values)
 
     # GPU aggregates over frames with a valid target_gpu_us. gpu_frame_count
-    # == 0 means GPU was not captured (non-D3D11 host); the ms_* lines are
-    # then 0.0000 and every target_gpu_us cell is blank. Matches C++ ComputeStats.
+    # == 0 means GPU was not captured (non-D3D11 host); the ms_*/pct_* lines
+    # are then 0.0000 and every target_gpu_us cell is blank. The pct subset
+    # also requires a frame_interval. Matches C++ ComputeStats.
     gpu_ms_values = [v / 1000.0 for v in gpu_values]
     target_gpu_ms_mean, target_gpu_ms_min, target_gpu_ms_max = _summarize(gpu_ms_values)
+    target_gpu_pct_mean, target_gpu_pct_min, target_gpu_pct_max = _summarize(
+        gpu_pct_values)
 
     # newline="" disables the file object's translation; lineterminator='\n'
     # disables csv.writer's default '\r\n'. Together they keep the output
@@ -429,21 +446,24 @@ def main() -> int:
     # path produced it.
     with args.out.open("w", newline="", encoding="utf-8") as fh:
         fh.write(f"# frame_count={len(merged)}\n")
-        fh.write(f"# target_ms_mean={target_ms_mean:.4f}\n")
-        fh.write(f"# target_ms_min={target_ms_min:.4f}\n")
-        fh.write(f"# target_ms_max={target_ms_max:.4f}\n")
-        fh.write(f"# target_pct_mean={target_pct_mean:.4f}%\n")
-        fh.write(f"# target_pct_min={target_pct_min:.4f}%\n")
-        fh.write(f"# target_pct_max={target_pct_max:.4f}%\n")
-        fh.write(f"# target_gpu_frame_count={len(gpu_values)}\n")
+        fh.write(f"# target_cpu_ms_mean={target_cpu_ms_mean:.4f}\n")
+        fh.write(f"# target_cpu_ms_min={target_cpu_ms_min:.4f}\n")
+        fh.write(f"# target_cpu_ms_max={target_cpu_ms_max:.4f}\n")
+        fh.write(f"# target_cpu_pct_mean={target_cpu_pct_mean:.4f}%\n")
+        fh.write(f"# target_cpu_pct_min={target_cpu_pct_min:.4f}%\n")
+        fh.write(f"# target_cpu_pct_max={target_cpu_pct_max:.4f}%\n")
+        fh.write(f"# gpu_frame_count={len(gpu_values)}\n")
         fh.write(f"# target_gpu_ms_mean={target_gpu_ms_mean:.4f}\n")
         fh.write(f"# target_gpu_ms_min={target_gpu_ms_min:.4f}\n")
         fh.write(f"# target_gpu_ms_max={target_gpu_ms_max:.4f}\n")
+        fh.write(f"# target_gpu_pct_mean={target_gpu_pct_mean:.4f}%\n")
+        fh.write(f"# target_gpu_pct_min={target_gpu_pct_min:.4f}%\n")
+        fh.write(f"# target_gpu_pct_max={target_gpu_pct_max:.4f}%\n")
         w = csv.writer(fh, lineterminator="\n")
         w.writerow(["display_time", "thread_id", "frame_interval_us",
-                    "pre_us", "post_us", "target_us", "target_pct_of_frame",
-                    "target_gpu_us"])
-        for fi, tid, fiv, pu, postu, tu, pct, gpu in merged:
+                    "pre_us", "post_us", "target_us", "target_cpu_pct_of_frame",
+                    "target_gpu_us", "target_gpu_pct_of_frame"])
+        for fi, tid, fiv, pu, postu, tu, pct, gpu, gpu_pct in merged:
             w.writerow([
                 fi,
                 tid,
@@ -453,6 +473,7 @@ def main() -> int:
                 f"{tu:.3f}",
                 "" if pct is None or math.isnan(pct) else f"{pct:.4f}",
                 "" if gpu is None or math.isnan(gpu) else f"{gpu:.3f}",
+                "" if gpu_pct is None or math.isnan(gpu_pct) else f"{gpu_pct:.4f}",
             ])
     print(f"wrote {args.out}")
     return 0
