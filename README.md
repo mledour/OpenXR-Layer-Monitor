@@ -1,4 +1,4 @@
-# OpenXR-Layer-Monitor
+# XR Layer Monitor
 
 Measure the per-frame CPU **and GPU** cost an OpenXR API layer adds to your
 application, without modifying the target layer. You install two tiny layers
